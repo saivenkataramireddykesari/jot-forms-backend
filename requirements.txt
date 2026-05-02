@@ -2,3 +2,4 @@ flask
 flask-cors
 pymysql
 PyJWT
+python-dotenv

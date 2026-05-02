@@ -5,6 +5,11 @@ import traceback
 import base64 as b64lib
 import jwt
 import datetime
+import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
@@ -16,14 +21,19 @@ JWT_EXPIRES = 8   # hours
 
 # ─── Database Configuration ────────────────────────────────────────────────────
 db_config = {
-    'host': 'localhost',
-    'user': 'root',
-    'password': 'root',          # update if your MySQL password differs
-    'database': 'employee_portal_db',
+    'host': os.getenv('DB_HOST', 'localhost'),
+    'port': int(os.getenv('DB_PORT', 3306)),
+    'user': os.getenv('DB_USER', 'root'),
+    'password': os.getenv('DB_PASSWORD', ''),
+    'database': os.getenv('DB_NAME', 'employee_portal_db'),
     'cursorclass': pymysql.cursors.DictCursor,
     'connect_timeout': 10,
     'charset': 'utf8mb4'
 }
+
+# If SSL is required (e.g., for Aiven)
+if os.getenv('DB_SSL_MODE') == 'REQUIRED':
+    db_config['ssl'] = {'ssl': True}
 
 # ─── DB Helper ─────────────────────────────────────────────────────────────────
 def get_db_connection():
@@ -43,10 +53,13 @@ def get_db_connection():
 def init_db():
     try:
         temp_config = {k: v for k, v in db_config.items() if k != 'database'}
+        if 'ssl' in db_config:
+            temp_config['ssl'] = db_config['ssl']
         print("[INIT] Creating database if not exists...")
         conn = pymysql.connect(**temp_config)
         with conn.cursor() as cursor:
-            cursor.execute("CREATE DATABASE IF NOT EXISTS employee_portal_db")
+            db_name = os.getenv('DB_NAME', 'employee_portal_db')
+            cursor.execute(f"CREATE DATABASE IF NOT EXISTS {db_name}")
         conn.commit()
         conn.close()
 
