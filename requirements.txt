@@ -1,5 +1,6 @@
-flask
-flask-cors
+fastapi
+uvicorn[standard]
 pymysql
 PyJWT
 python-dotenv
+pydantic

@@ -1,5 +1,7 @@
-from flask import Flask, request, jsonify
-from flask_cors import CORS
+from fastapi import FastAPI, Depends, HTTPException, Request, Header, status
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional, List
 import pymysql
 import traceback
 import base64 as b64lib
@@ -7,14 +9,12 @@ import jwt
 import datetime
 import os
 from dotenv import load_dotenv
+from contextlib import asynccontextmanager
 
 # Load environment variables from .env file
 load_dotenv()
 
-app = Flask(__name__)
-CORS(app)
-
-# ─── JWT Secret (change this to a strong random string in production) ──────────
+# ─── JWT Config ───────────────────────────────────────────────────────────────
 JWT_SECRET  = 'emp_portal_super_secret_2024'
 JWT_ALGO    = 'HS256'
 JWT_EXPIRES = 8   # hours
@@ -31,31 +31,24 @@ db_config = {
     'charset': 'utf8mb4'
 }
 
-# If SSL is required (e.g., for Aiven)
 if os.getenv('DB_SSL_MODE') == 'REQUIRED':
     db_config['ssl'] = {'ssl': True}
 
 # ─── DB Helper ─────────────────────────────────────────────────────────────────
 def get_db_connection():
     try:
-        print("[DB] Connecting to MySQL...")
         conn = pymysql.connect(**db_config)
-        print("[DB] Connection successful.")
         return conn
-    except pymysql.err.OperationalError as e:
-        print(f"[DB ERROR] OperationalError: {e}")
-        return None
     except Exception as e:
-        print(f"[DB ERROR] Unexpected: {e}")
+        print(f"[DB ERROR] {e}")
         return None
 
-# ─── Init DB ───────────────────────────────────────────────────────────────────
 def init_db():
     try:
         temp_config = {k: v for k, v in db_config.items() if k != 'database'}
         if 'ssl' in db_config:
             temp_config['ssl'] = db_config['ssl']
-        print("[INIT] Creating database if not exists...")
+        
         conn = pymysql.connect(**temp_config)
         with conn.cursor() as cursor:
             db_name = os.getenv('DB_NAME', 'employee_portal_db')
@@ -64,11 +57,10 @@ def init_db():
         conn.close()
 
         conn = get_db_connection()
-        if not conn:
-            print("[INIT ERROR] Cannot connect to DB for table setup.")
-            return
+        if not conn: return
 
         with conn.cursor() as cursor:
+            # Forms Table
             cursor.execute("""
             CREATE TABLE IF NOT EXISTS forms (
                 id       INT AUTO_INCREMENT PRIMARY KEY,
@@ -77,6 +69,7 @@ def init_db():
                 url      VARCHAR(500) NOT NULL
             )""")
 
+            # Tokens Table
             cursor.execute("""
             CREATE TABLE IF NOT EXISTS tokens (
                 id          INT AUTO_INCREMENT PRIMARY KEY,
@@ -85,9 +78,9 @@ def init_db():
                 division    VARCHAR(50)  NOT NULL
             )""")
 
+            # Seed Tokens
             cursor.execute("SELECT COUNT(*) as count FROM tokens")
             if cursor.fetchone()['count'] == 0:
-                print("[INIT] Seeding default tokens...")
                 sample_tokens = [
                     ('tok_EMP1001_maxmus',   'EMP1001', 'maxmus'),
                     ('tok_EMP1002_nucles',   'EMP1002', 'nucles'),
@@ -96,162 +89,159 @@ def init_db():
                     ('tok_EMP1005_glamus',   'EMP1005', 'glamus'),
                     ('tok_EMP1006_nutrius',  'EMP1006', 'nutrius'),
                 ]
-                cursor.executemany(
-                    "INSERT INTO tokens (token, employee_id, division) VALUES (%s,%s,%s)",
-                    sample_tokens
-                )
+                cursor.executemany("INSERT INTO tokens (token, employee_id, division) VALUES (%s,%s,%s)", sample_tokens)
+
+            # Admins Table
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS admins (
+                id       INT AUTO_INCREMENT PRIMARY KEY,
+                username VARCHAR(50)  NOT NULL UNIQUE,
+                password VARCHAR(100) NOT NULL
+            )""")
+
+            # Seed Admin
+            cursor.execute("SELECT COUNT(*) as count FROM admins")
+            if cursor.fetchone()['count'] == 0:
+                cursor.execute("INSERT INTO admins (username, password) VALUES (%s, %s)", ('admin', 'admin123'))
+
         conn.commit()
         conn.close()
         print("[INIT] Database ready.")
     except Exception as e:
         print(f"[INIT ERROR] {e}")
-        traceback.print_exc()
 
-# ─── Safe JSON parser ──────────────────────────────────────────────────────────
-def get_json_body():
-    try:
-        data = request.get_json(silent=True, force=True)
-        if data is None:
-            print("[REQUEST] Warning: body is None or not valid JSON.")
-            return {}
-        print(f"[REQUEST] Body: {data}")
-        return data
-    except Exception as e:
-        print(f"[REQUEST ERROR] {e}")
-        return {}
+# ─── Models ───────────────────────────────────────────────────────────────────
+class AdminLoginRequest(BaseModel):
+    username: str
+    password: str
+
+class FormRequest(BaseModel):
+    division: str
+    name: str
+    url: str
+
+class EmployeeLoginRequest(BaseModel):
+    token: Optional[str] = None
+    employee_id: Optional[str] = None
 
 # ─── JWT helpers ───────────────────────────────────────────────────────────────
-def generate_jwt(employee_id, division):
-    """Create a signed JWT valid for JWT_EXPIRES hours."""
+def generate_jwt(user_id: str, role: str = 'employee', division: str = None):
     payload = {
-        'employee_id': employee_id,
-        'division':    division,
+        'user_id':  user_id,
+        'role':     role,
+        'division': division,
         'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=JWT_EXPIRES),
         'iat': datetime.datetime.utcnow(),
     }
-    token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
-    return token
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
 
-def verify_jwt(token_str):
-    """Decode and verify a JWT. Returns payload dict or None on failure."""
+def verify_jwt(token_str: str):
     try:
         payload = jwt.decode(token_str, JWT_SECRET, algorithms=[JWT_ALGO])
         return payload
-    except jwt.ExpiredSignatureError:
-        print("[JWT] Token expired.")
-        return None
-    except jwt.InvalidTokenError as e:
-        print(f"[JWT] Invalid token: {e}")
+    except Exception:
         return None
 
-def get_jwt_from_header():
-    """Extract Bearer token from Authorization header."""
-    auth = request.headers.get('Authorization', '')
-    if auth.startswith('Bearer '):
-        return auth[7:]
-    return None
+def get_current_admin(authorization: Optional[str] = Header(None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    
+    token = authorization[7:]
+    payload = verify_jwt(token)
+    if not payload or payload.get('role') != 'admin':
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return payload
 
-# ─── Admin: GET all forms ──────────────────────────────────────────────────────
-@app.route('/api/admin/forms', methods=['GET'])
-def get_all_forms():
-    print("[ROUTE] GET /api/admin/forms")
+# ─── App Setup ────────────────────────────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    yield
+
+app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ─── Routes ───────────────────────────────────────────────────────────────────
+
+@app.post("/api/admin/login")
+def admin_login(req: AdminLoginRequest):
     conn = get_db_connection()
-    if not conn:
-        return jsonify({'error': 'Database connection failed'}), 500
+    if not conn: raise HTTPException(status_code=500, detail="Database connection failed")
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT * FROM admins WHERE username=%s AND password=%s", (req.username, req.password))
+            admin = cursor.fetchone()
+        
+        if not admin:
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+        
+        token = generate_jwt(admin['username'], role='admin')
+        return {
+            "message": "Login successful",
+            "jwt_token": token,
+            "user": {"username": admin['username'], "role": "admin"}
+        }
+    finally:
+        conn.close()
+
+@app.get("/api/admin/forms")
+def get_all_forms(admin=Depends(get_current_admin)):
+    conn = get_db_connection()
+    if not conn: raise HTTPException(status_code=500, detail="Database connection failed")
     try:
         with conn.cursor() as cursor:
             cursor.execute("SELECT * FROM forms")
-            forms = cursor.fetchall()
-        return jsonify(forms), 200
-    except Exception as e:
-        print(f"[ERROR] get_all_forms: {e}")
-        return jsonify({'error': str(e)}), 500
+            return cursor.fetchall()
     finally:
         conn.close()
 
-# ─── Admin: POST add form ──────────────────────────────────────────────────────
-@app.route('/api/admin/forms', methods=['POST'])
-def add_form():
-    print("[ROUTE] POST /api/admin/forms")
-    data     = get_json_body()
-    division = data.get('division', '').strip()
-    name     = data.get('name',     '').strip()
-    url      = data.get('url',      '').strip()
-
-    if not division or not name or not url:
-        return jsonify({'error': 'Missing required fields: division, name, url'}), 400
-
+@app.post("/api/admin/forms", status_code=201)
+def add_form(req: FormRequest, admin=Depends(get_current_admin)):
     conn = get_db_connection()
-    if not conn:
-        return jsonify({'error': 'Database connection failed'}), 500
+    if not conn: raise HTTPException(status_code=500, detail="Database connection failed")
     try:
         with conn.cursor() as cursor:
-            cursor.execute(
-                "INSERT INTO forms (division, name, url) VALUES (%s,%s,%s)",
-                (division, name, url)
-            )
+            cursor.execute("INSERT INTO forms (division, name, url) VALUES (%s,%s,%s)", (req.division, req.name, req.url))
         conn.commit()
-        return jsonify({'message': 'Form added successfully'}), 201
-    except Exception as e:
-        print(f"[ERROR] add_form: {e}")
-        return jsonify({'error': str(e)}), 500
+        return {"message": "Form added successfully"}
     finally:
         conn.close()
 
-# ─── Admin: PUT update form ────────────────────────────────────────────────────
-@app.route('/api/admin/forms/<int:form_id>', methods=['PUT'])
-def update_form(form_id):
-    print(f"[ROUTE] PUT /api/admin/forms/{form_id}")
-    data     = get_json_body()
-    division = data.get('division', '').strip()
-    name     = data.get('name',     '').strip()
-    url      = data.get('url',      '').strip()
-
-    if not division or not name or not url:
-        return jsonify({'error': 'Missing required fields: division, name, url'}), 400
-
+@app.put("/api/admin/forms/{form_id}")
+def update_form(form_id: int, req: FormRequest, admin=Depends(get_current_admin)):
     conn = get_db_connection()
-    if not conn:
-        return jsonify({'error': 'Database connection failed'}), 500
+    if not conn: raise HTTPException(status_code=500, detail="Database connection failed")
     try:
         with conn.cursor() as cursor:
-            cursor.execute(
-                "UPDATE forms SET division=%s, name=%s, url=%s WHERE id=%s",
-                (division, name, url, form_id)
-            )
+            cursor.execute("UPDATE forms SET division=%s, name=%s, url=%s WHERE id=%s", (req.division, req.name, req.url, form_id))
         conn.commit()
-        return jsonify({'message': 'Form updated successfully'}), 200
-    except Exception as e:
-        print(f"[ERROR] update_form: {e}")
-        return jsonify({'error': str(e)}), 500
+        return {"message": "Form updated successfully"}
     finally:
         conn.close()
 
-# ─── Admin: DELETE form ────────────────────────────────────────────────────────
-@app.route('/api/admin/forms/<int:form_id>', methods=['DELETE'])
-def delete_form(form_id):
-    print(f"[ROUTE] DELETE /api/admin/forms/{form_id}")
+@app.delete("/api/admin/forms/{form_id}")
+def delete_form(form_id: int, admin=Depends(get_current_admin)):
     conn = get_db_connection()
-    if not conn:
-        return jsonify({'error': 'Database connection failed'}), 500
+    if not conn: raise HTTPException(status_code=500, detail="Database connection failed")
     try:
         with conn.cursor() as cursor:
             cursor.execute("DELETE FROM forms WHERE id=%s", (form_id,))
         conn.commit()
-        return jsonify({'message': 'Form deleted successfully'}), 200
-    except Exception as e:
-        print(f"[ERROR] delete_form: {e}")
-        return jsonify({'error': str(e)}), 500
+        return {"message": "Form deleted successfully"}
     finally:
         conn.close()
 
-# ─── Admin: GET all tokens (read-only, for Employee URLs tab) ──────────────────
-@app.route('/api/admin/tokens', methods=['GET'])
-def get_all_tokens():
-    print("[ROUTE] GET /api/admin/tokens")
+@app.get("/api/admin/tokens")
+def get_all_tokens(admin=Depends(get_current_admin)):
     conn = get_db_connection()
-    if not conn:
-        return jsonify({'error': 'Database connection failed'}), 500
+    if not conn: raise HTTPException(status_code=500, detail="Database connection failed")
     try:
         with conn.cursor() as cursor:
             cursor.execute("SELECT id, employee_id, division FROM tokens")
@@ -260,124 +250,62 @@ def get_all_tokens():
             encoded = b64lib.b64encode(t['employee_id'].encode()).decode()
             t['portal_url'] = f"http://localhost:5173/auth?data={encoded}"
             t['data_param'] = encoded
-        return jsonify(tokens), 200
-    except Exception as e:
-        print(f"[ERROR] get_all_tokens: {e}")
-        return jsonify({'error': str(e)}), 500
+        return tokens
     finally:
         conn.close()
 
-# ─── Employee: Login with Base64 token → returns JWT ──────────────────────────
-@app.route('/api/employee/login', methods=['POST'])
-def employee_login():
-    """
-    Accepts:  { "token": "<base64_encoded_employee_id>" }
-              OR { "employee_id": "<plain_employee_id>" }  (legacy)
-
-    Flow:
-      1. If 'token' key → base64 decode to get employee_id
-      2. Look up employee_id in tokens table
-      3. On success → generate JWT and return it
-      4. On failure → 401
-    """
-    print("[ROUTE] POST /api/employee/login")
-    data = get_json_body()
-
-    b64_token   = data.get('token',       '').strip()
-    plain_empid = data.get('employee_id', '').strip()
-
+@app.post("/api/employee/login")
+def employee_login(req: EmployeeLoginRequest):
     employee_id = None
-
-    # ── Decode Base64 token (primary path) ────────────────────────────────
-    if b64_token:
+    if req.token:
         try:
-            employee_id = b64lib.b64decode(b64_token).decode('utf-8').strip()
-            print(f"[AUTH] Base64 decoded employee_id: {employee_id!r}")
-        except Exception as e:
-            print(f"[AUTH] Base64 decode failed: {e}")
-            return jsonify({'error': 'Invalid token format. Base64 decode failed.'}), 400
-
-    # ── Plain employee_id fallback ─────────────────────────────────────────
-    elif plain_empid:
-        employee_id = plain_empid
-        print(f"[AUTH] Plain employee_id: {employee_id!r}")
-
-    else:
-        return jsonify({'error': 'token or employee_id is required'}), 400
-
+            employee_id = b64lib.b64decode(req.token).decode('utf-8').strip()
+        except:
+            raise HTTPException(status_code=400, detail="Invalid token format")
+    elif req.employee_id:
+        employee_id = req.employee_id
+    
     if not employee_id:
-        return jsonify({'error': 'Token decodes to empty value'}), 400
+        raise HTTPException(status_code=400, detail="token or employee_id is required")
 
-    # ── DB lookup ─────────────────────────────────────────────────────────
     conn = get_db_connection()
-    if not conn:
-        return jsonify({'error': 'Database connection failed'}), 500
+    if not conn: raise HTTPException(status_code=500, detail="Database connection failed")
     try:
         with conn.cursor() as cursor:
-            print(f"[SQL] SELECT * FROM tokens WHERE employee_id={employee_id!r}")
             cursor.execute("SELECT * FROM tokens WHERE employee_id=%s", (employee_id,))
             emp = cursor.fetchone()
-
+        
         if not emp:
-            print(f"[AUTH] No employee found for id: {employee_id!r}")
-            return jsonify({'error': 'Invalid or expired token. Employee not found.'}), 401
-
-        # ── Generate JWT ──────────────────────────────────────────────────
-        jwt_token = generate_jwt(emp['employee_id'], emp['division'])
-        print(f"[AUTH] JWT issued for {emp['employee_id']} / {emp['division']}")
-
-        return jsonify({
-            'message': 'Login successful',
-            'jwt_token': jwt_token,
-            'employee': {
-                'employee_id': emp['employee_id'],
-                'division':    emp['division']
-            }
-        }), 200
-
-    except Exception as e:
-        print(f"[ERROR] employee_login: {e}")
-        traceback.print_exc()
-        return jsonify({'error': str(e)}), 500
+            raise HTTPException(status_code=401, detail="Employee not found")
+        
+        token = generate_jwt(emp['employee_id'], role='employee', division=emp['division'])
+        return {
+            "message": "Login successful",
+            "jwt_token": token,
+            "employee": {"employee_id": emp['employee_id'], "division": emp['division']}
+        }
     finally:
         conn.close()
 
-# ─── Employee: Get forms (JWT protected) ──────────────────────────────────────
-@app.route('/api/employee/forms', methods=['GET'])
-def get_employee_forms():
-    division = request.args.get('division', '').strip()
-    print(f"[ROUTE] GET /api/employee/forms?division={division!r}")
-
-    # ── Verify JWT from Authorization header ──────────────────────────────
-    token_str = get_jwt_from_header()
-    if token_str:
-        payload = verify_jwt(token_str)
+@app.get("/api/employee/forms")
+def get_employee_forms(division: str, authorization: Optional[str] = Header(None)):
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization[7:]
+        payload = verify_jwt(token)
         if not payload:
-            return jsonify({'error': 'Session expired. Please re-open your portal link.'}), 401
-        # Enforce: JWT division must match requested division
+            raise HTTPException(status_code=401, detail="Session expired")
         if payload.get('division') != division:
-            print(f"[SECURITY] Division mismatch: JWT={payload.get('division')!r} requested={division!r}")
-            return jsonify({'error': 'Access denied. Division mismatch.'}), 403
-
-    if not division:
-        return jsonify({'error': 'Division query param is required'}), 400
+            raise HTTPException(status_code=403, detail="Division mismatch")
 
     conn = get_db_connection()
-    if not conn:
-        return jsonify({'error': 'Database connection failed'}), 500
+    if not conn: raise HTTPException(status_code=500, detail="Database connection failed")
     try:
         with conn.cursor() as cursor:
             cursor.execute("SELECT * FROM forms WHERE division=%s", (division,))
-            forms = cursor.fetchall()
-            print(f"[SQL] {len(forms)} forms for '{division}'.")
-        return jsonify(forms), 200
-    except Exception as e:
-        print(f"[ERROR] get_employee_forms: {e}")
-        return jsonify({'error': str(e)}), 500
+            return cursor.fetchall()
     finally:
         conn.close()
 
-# ─── Run ───────────────────────────────────────────────────────────────────────
-if __name__ == '__main__':
-    init_db()
-    app.run(debug=True, port=5000)
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=5000)
