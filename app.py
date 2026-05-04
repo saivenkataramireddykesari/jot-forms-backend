@@ -69,27 +69,50 @@ def init_db():
                 url      VARCHAR(500) NOT NULL
             )""")
 
-            # Tokens Table
+            # Employees Table
             cursor.execute("""
-            CREATE TABLE IF NOT EXISTS tokens (
+            CREATE TABLE IF NOT EXISTS employees (
+                employee_id VARCHAR(50) PRIMARY KEY,
+                division    VARCHAR(50) NOT NULL
+            )""")
+
+            # Seed Employees
+            cursor.execute("SELECT COUNT(*) as count FROM employees")
+            if cursor.fetchone()['count'] == 0:
+                sample_emps = [
+                    ('EMP1001', 'maxmus'),
+                    ('EMP1002', 'nucles'),
+                    ('EMP1003', 'gladius'),
+                    ('EMP1004', 'stimulas'),
+                    ('EMP1005', 'glamus'),
+                    ('EMP1006', 'nutrius'),
+                ]
+                cursor.executemany("INSERT INTO employees (employee_id, division) VALUES (%s,%s)", sample_emps)
+
+            # Employee Tokens Table
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS employee_tokens (
                 id          INT AUTO_INCREMENT PRIMARY KEY,
-                token       VARCHAR(100) NOT NULL UNIQUE,
                 employee_id VARCHAR(50)  NOT NULL,
-                division    VARCHAR(50)  NOT NULL
+                token       VARCHAR(255) NOT NULL UNIQUE,
+                is_used     TINYINT(1)   DEFAULT 0,
+                created_at  TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+                expires_at  DATETIME     NOT NULL,
+                used_at     DATETIME
             )""")
 
             # Seed Tokens
-            cursor.execute("SELECT COUNT(*) as count FROM tokens")
+            cursor.execute("SELECT COUNT(*) as count FROM employee_tokens")
             if cursor.fetchone()['count'] == 0:
                 sample_tokens = [
-                    ('tok_EMP1001_maxmus',   'EMP1001', 'maxmus'),
-                    ('tok_EMP1002_nucles',   'EMP1002', 'nucles'),
-                    ('tok_EMP1003_gladius',  'EMP1003', 'gladius'),
-                    ('tok_EMP1004_stimulas', 'EMP1004', 'stimulas'),
-                    ('tok_EMP1005_glamus',   'EMP1005', 'glamus'),
-                    ('tok_EMP1006_nutrius',  'EMP1006', 'nutrius'),
+                    ('EMP1001', 'RU1QMTAwMQ==', '2099-12-31 23:59:59'),
+                    ('EMP1002', 'RU1QMTAwMg==', '2099-12-31 23:59:59'),
+                    ('EMP1003', 'RU1QMTAwMw==', '2099-12-31 23:59:59'),
+                    ('EMP1004', 'RU1QMTAwNA==', '2099-12-31 23:59:59'),
+                    ('EMP1005', 'RU1QMTAwNQ==', '2099-12-31 23:59:59'),
+                    ('EMP1006', 'RU1QMTAwNg==', '2099-12-31 23:59:59'),
                 ]
-                cursor.executemany("INSERT INTO tokens (token, employee_id, division) VALUES (%s,%s,%s)", sample_tokens)
+                cursor.executemany("INSERT INTO employee_tokens (employee_id, token, expires_at) VALUES (%s,%s,%s)", sample_tokens)
 
             # Admins Table
             cursor.execute("""
@@ -243,45 +266,60 @@ def get_all_tokens(admin=Depends(get_current_admin)):
     if not conn: raise HTTPException(status_code=500, detail="Database connection failed")
     try:
         with conn.cursor() as cursor:
-            cursor.execute("SELECT id, employee_id, division FROM tokens")
+            cursor.execute("SELECT t.id, t.employee_id, e.division, t.token FROM employee_tokens t JOIN employees e ON t.employee_id = e.employee_id")
             tokens = cursor.fetchall()
         for t in tokens:
-            encoded = b64lib.b64encode(t['employee_id'].encode()).decode()
-            t['portal_url'] = f"http://localhost:5173/auth?data={encoded}"
-            t['data_param'] = encoded
+            t['portal_url'] = f"http://localhost:5173/auth?data={t['token']}"
+            t['data_param'] = t['token']
         return tokens
     finally:
         conn.close()
 
 @app.post("/api/employee/login")
 def employee_login(req: EmployeeLoginRequest):
-    employee_id = None
-    if req.token:
-        try:
-            employee_id = b64lib.b64decode(req.token).decode('utf-8').strip()
-        except:
-            raise HTTPException(status_code=400, detail="Invalid token format")
-    elif req.employee_id:
-        employee_id = req.employee_id
-    
-    if not employee_id:
-        raise HTTPException(status_code=400, detail="token or employee_id is required")
+    if not req.token:
+        raise HTTPException(status_code=400, detail="token is required")
 
     conn = get_db_connection()
     if not conn: raise HTTPException(status_code=500, detail="Database connection failed")
     try:
         with conn.cursor() as cursor:
-            cursor.execute("SELECT * FROM tokens WHERE employee_id=%s", (employee_id,))
+            cursor.execute("SELECT * FROM employee_tokens WHERE token=%s", (req.token,))
+            token_record = cursor.fetchone()
+        
+        if not token_record:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+            
+        if token_record['is_used']:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+            
+        if token_record['expires_at'] < datetime.datetime.now():
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+        try:
+            employee_id = b64lib.b64decode(req.token).decode('utf-8').strip()
+        except:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+        if employee_id != token_record['employee_id']:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT * FROM employees WHERE employee_id=%s", (employee_id,))
             emp = cursor.fetchone()
         
         if not emp:
-            raise HTTPException(status_code=401, detail="Employee not found")
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+            
+        # Note: Marking as used is optional. We skip it here to allow permanent link usage 
+        # based on the user's previous request. But if desired, it would be:
+        # cursor.execute("UPDATE employee_tokens SET is_used=1, used_at=CURRENT_TIMESTAMP WHERE id=%s", (token_record['id'],))
+        # conn.commit()
         
-        token = generate_jwt(emp['employee_id'], role='employee', division=emp['division'])
+        jwt_token = generate_jwt(emp['employee_id'], role='employee', division=emp['division'])
         return {
-            "message": "Login successful",
-            "jwt_token": token,
-            "employee": {"employee_id": emp['employee_id'], "division": emp['division']}
+            "employee": {"employee_id": emp['employee_id'], "division": emp['division']},
+            "jwt_token": jwt_token
         }
     finally:
         conn.close()
