@@ -276,8 +276,8 @@ def employee_login(req: EmployeeLoginRequest):
         raise HTTPException(status_code=500, detail="Database connection failed")
     try:
         with conn.cursor() as cur:
-            # 1. Try searching by the raw token as the employee_id (for plain text cases like ?data=EMP1001)
-            cur.execute("SELECT * FROM auto_login_tokens WHERE employee_id=%s", (req.token,))
+            # 1. Try searching by the raw token as EITHER the employee_id OR the token column
+            cur.execute("SELECT * FROM auto_login_tokens WHERE employee_id=%s OR token=%s", (req.token, req.token))
             record = cur.fetchone()
             
             # 2. If not found, it might be a Base64 encoded ID (for ?data=RU1QMTAwMQ==)
