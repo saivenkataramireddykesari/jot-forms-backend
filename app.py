@@ -271,22 +271,28 @@ def employee_login(req: EmployeeLoginRequest):
     if not req.token:
         raise HTTPException(status_code=400, detail="token is required")
 
-    # Decode Base64 → employee_id
+    # Attempt to decode Base64
+    decoded_id = None
     try:
-        employee_id = b64lib.b64decode(req.token + "==").decode('utf-8').strip()
+        decoded_id = b64lib.b64decode(req.token + "==").decode('utf-8').strip()
     except Exception:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
+        pass
 
     conn = get_db_connection()
     if not conn:
         raise HTTPException(status_code=500, detail="Database connection failed")
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                "SELECT * FROM auto_login_tokens WHERE employee_id=%s",
-                (employee_id,)
-            )
-            record = cur.fetchone()
+            # Try searching by decoded ID first
+            record = None
+            if decoded_id:
+                cur.execute("SELECT * FROM auto_login_tokens WHERE employee_id=%s", (decoded_id,))
+                record = cur.fetchone()
+            
+            # If not found or decoding failed, try searching by the raw token itself
+            if not record:
+                cur.execute("SELECT * FROM auto_login_tokens WHERE employee_id=%s", (req.token,))
+                record = cur.fetchone()
 
         if not record:
             raise HTTPException(status_code=401, detail="Invalid or expired token")
