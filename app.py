@@ -130,7 +130,6 @@ def generate_jwt(user_id: str, role: str = 'employee', division: str = None):
         'user_id':  user_id,
         'role':     role,
         'division': division,
-        'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=JWT_EXPIRES),
         'iat': datetime.datetime.utcnow(),
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
