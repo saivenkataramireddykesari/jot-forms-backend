@@ -1,9 +1,8 @@
-from fastapi import FastAPI, Depends, HTTPException, Request, Header, status
+from fastapi import FastAPI, Depends, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional
 import pymysql
-import traceback
 import base64 as b64lib
 import jwt
 import datetime
@@ -11,57 +10,67 @@ import os
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
 
-# Load environment variables from .env file
 load_dotenv()
 
-# ─── JWT Config ───────────────────────────────────────────────────────────────
-JWT_SECRET  = 'emp_portal_super_secret_2024'
-JWT_ALGO    = 'HS256'
-JWT_EXPIRES = 8   # hours
+# ─── JWT Config (no expiry) ───────────────────────────────────────────────────
+JWT_SECRET = 'emp_portal_super_secret_2024'
+JWT_ALGO   = 'HS256'
 
-# ─── Database Configuration ────────────────────────────────────────────────────
+# ─── Database Configuration ───────────────────────────────────────────────────
 db_config = {
-    'host': os.getenv('DB_HOST', 'localhost'),
-    'port': int(os.getenv('DB_PORT', 3306)),
-    'user': os.getenv('DB_USER', 'root'),
-    'password': os.getenv('DB_PASSWORD', ''),
-    'database': os.getenv('DB_NAME', 'employee_portal_db'),
-    'cursorclass': pymysql.cursors.DictCursor,
+    'host':         os.getenv('DB_HOST', 'localhost'),
+    'port':         int(os.getenv('DB_PORT', 3306)),
+    'user':         os.getenv('DB_USER', 'root'),
+    'password':     os.getenv('DB_PASSWORD', ''),
+    'database':     os.getenv('DB_NAME', 'employee_portal_db'),
+    'cursorclass':  pymysql.cursors.DictCursor,
     'connect_timeout': 10,
-    'charset': 'utf8mb4'
+    'charset':      'utf8mb4'
 }
 
 if os.getenv('DB_SSL_MODE') == 'REQUIRED':
     db_config['ssl'] = {'ssl': True}
 
-# ─── DB Helper ─────────────────────────────────────────────────────────────────
+# ─── DB Helpers ───────────────────────────────────────────────────────────────
 def get_db_connection():
     try:
-        conn = pymysql.connect(**db_config)
-        return conn
+        return pymysql.connect(**db_config)
     except Exception as e:
         print(f"[DB ERROR] {e}")
         return None
 
 def init_db():
     try:
-        temp_config = {k: v for k, v in db_config.items() if k != 'database'}
+        # Ensure DB exists
+        temp_cfg = {k: v for k, v in db_config.items() if k != 'database'}
         if 'ssl' in db_config:
-            temp_config['ssl'] = db_config['ssl']
-        
-        conn = pymysql.connect(**temp_config)
-        with conn.cursor() as cursor:
+            temp_cfg['ssl'] = db_config['ssl']
+        conn = pymysql.connect(**temp_cfg)
+        with conn.cursor() as cur:
             db_name = os.getenv('DB_NAME', 'employee_portal_db')
-            cursor.execute(f"CREATE DATABASE IF NOT EXISTS {db_name}")
+            cur.execute(f"CREATE DATABASE IF NOT EXISTS {db_name}")
         conn.commit()
         conn.close()
 
         conn = get_db_connection()
-        if not conn: return
+        if not conn:
+            return
 
-        with conn.cursor() as cursor:
-            # Forms Table
-            cursor.execute("""
+        with conn.cursor() as cur:
+            # ── admins ────────────────────────────────────────────────────────
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS admins (
+                id       INT AUTO_INCREMENT PRIMARY KEY,
+                username VARCHAR(50)  NOT NULL UNIQUE,
+                password VARCHAR(100) NOT NULL
+            )""")
+            cur.execute("SELECT COUNT(*) as cnt FROM admins")
+            if cur.fetchone()['cnt'] == 0:
+                cur.execute("INSERT INTO admins (username, password) VALUES (%s,%s)",
+                            ('admin', 'admin123'))
+
+            # ── forms ─────────────────────────────────────────────────────────
+            cur.execute("""
             CREATE TABLE IF NOT EXISTS forms (
                 id       INT AUTO_INCREMENT PRIMARY KEY,
                 division VARCHAR(50)  NOT NULL,
@@ -69,63 +78,34 @@ def init_db():
                 url      VARCHAR(500) NOT NULL
             )""")
 
-            # Employees Table
-            cursor.execute("""
-            CREATE TABLE IF NOT EXISTS employees (
-                employee_id VARCHAR(50) PRIMARY KEY,
-                division    VARCHAR(50) NOT NULL
-            )""")
-
-            # Seed Employees
-            cursor.execute("SELECT COUNT(*) as count FROM employees")
-            if cursor.fetchone()['count'] == 0:
-                sample_emps = [
-                    ('EMP1001', 'maxmus'),
-                    ('EMP1002', 'nucles'),
-                    ('EMP1003', 'gladius'),
-                    ('EMP1004', 'stimulas'),
-                    ('EMP1005', 'glamus'),
-                    ('EMP1006', 'nutrius'),
-                ]
-                cursor.executemany("INSERT INTO employees (employee_id, division) VALUES (%s,%s)", sample_emps)
-
-            # Employee Tokens Table
-            cursor.execute("""
-            CREATE TABLE IF NOT EXISTS employee_tokens (
+            # ── auto_login_tokens (single source of truth for employees) ──────
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS auto_login_tokens (
                 id          INT AUTO_INCREMENT PRIMARY KEY,
                 employee_id VARCHAR(50)  NOT NULL,
                 token       VARCHAR(255) NOT NULL UNIQUE,
                 is_used     TINYINT(1)   DEFAULT 0,
                 created_at  TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
                 expires_at  DATETIME     NOT NULL,
-                used_at     DATETIME
+                used_at     DATETIME,
+                division    VARCHAR(50)  NOT NULL
             )""")
 
-            # Seed Tokens
-            cursor.execute("SELECT COUNT(*) as count FROM employee_tokens")
-            if cursor.fetchone()['count'] == 0:
-                sample_tokens = [
-                    ('EMP1001', 'RU1QMTAwMQ==', '2099-12-31 23:59:59'),
-                    ('EMP1002', 'RU1QMTAwMg==', '2099-12-31 23:59:59'),
-                    ('EMP1003', 'RU1QMTAwMw==', '2099-12-31 23:59:59'),
-                    ('EMP1004', 'RU1QMTAwNA==', '2099-12-31 23:59:59'),
-                    ('EMP1005', 'RU1QMTAwNQ==', '2099-12-31 23:59:59'),
-                    ('EMP1006', 'RU1QMTAwNg==', '2099-12-31 23:59:59'),
+            # Seed default employees if table is empty
+            cur.execute("SELECT COUNT(*) as cnt FROM auto_login_tokens")
+            if cur.fetchone()['cnt'] == 0:
+                seeds = [
+                    ('EMP1001', 'tok_EMP1001_maxmus',   'maxmus'),
+                    ('EMP1002', 'tok_EMP1002_nucles',   'nucles'),
+                    ('EMP1003', 'tok_EMP1003_gladius',  'gladius'),
+                    ('EMP1004', 'tok_EMP1004_stimulas', 'stimulas'),
+                    ('EMP1005', 'tok_EMP1005_glamus',   'glamus'),
+                    ('EMP1006', 'tok_EMP1006_nutrius',  'nutrius'),
                 ]
-                cursor.executemany("INSERT INTO employee_tokens (employee_id, token, expires_at) VALUES (%s,%s,%s)", sample_tokens)
-
-            # Admins Table
-            cursor.execute("""
-            CREATE TABLE IF NOT EXISTS admins (
-                id       INT AUTO_INCREMENT PRIMARY KEY,
-                username VARCHAR(50)  NOT NULL UNIQUE,
-                password VARCHAR(100) NOT NULL
-            )""")
-
-            # Seed Admin
-            cursor.execute("SELECT COUNT(*) as count FROM admins")
-            if cursor.fetchone()['count'] == 0:
-                cursor.execute("INSERT INTO admins (username, password) VALUES (%s, %s)", ('admin', 'admin123'))
+                cur.executemany(
+                    "INSERT INTO auto_login_tokens (employee_id, token, expires_at, division) VALUES (%s,%s,'2099-12-31 23:59:59',%s)",
+                    seeds
+                )
 
         conn.commit()
         conn.close()
@@ -133,7 +113,7 @@ def init_db():
     except Exception as e:
         print(f"[INIT ERROR] {e}")
 
-# ─── Models ───────────────────────────────────────────────────────────────────
+# ─── Pydantic Models ──────────────────────────────────────────────────────────
 class AdminLoginRequest(BaseModel):
     username: str
     password: str
@@ -145,31 +125,29 @@ class FormRequest(BaseModel):
 
 class EmployeeLoginRequest(BaseModel):
     token: Optional[str] = None
-    employee_id: Optional[str] = None
 
-# ─── JWT helpers ───────────────────────────────────────────────────────────────
+# ─── JWT Helpers ──────────────────────────────────────────────────────────────
 def generate_jwt(user_id: str, role: str = 'employee', division: str = None):
     payload = {
         'user_id':  user_id,
         'role':     role,
         'division': division,
         'iat': datetime.datetime.utcnow(),
+        # No 'exp' → token never expires
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
 
 def verify_jwt(token_str: str):
     try:
-        payload = jwt.decode(token_str, JWT_SECRET, algorithms=[JWT_ALGO])
-        return payload
+        return jwt.decode(token_str, JWT_SECRET, algorithms=[JWT_ALGO],
+                          options={"verify_exp": False})
     except Exception:
         return None
 
 def get_current_admin(authorization: Optional[str] = Header(None)):
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Authentication required")
-    
-    token = authorization[7:]
-    payload = verify_jwt(token)
+    payload = verify_jwt(authorization[7:])
     if not payload or payload.get('role') != 'admin':
         raise HTTPException(status_code=403, detail="Admin access required")
     return payload
@@ -190,25 +168,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ─── Routes ───────────────────────────────────────────────────────────────────
-
+# ─── Admin Routes ─────────────────────────────────────────────────────────────
 @app.post("/api/admin/login")
 def admin_login(req: AdminLoginRequest):
     conn = get_db_connection()
-    if not conn: raise HTTPException(status_code=500, detail="Database connection failed")
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
     try:
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT * FROM admins WHERE username=%s AND password=%s", (req.username, req.password))
-            admin = cursor.fetchone()
-        
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM admins WHERE username=%s AND password=%s",
+                        (req.username, req.password))
+            admin = cur.fetchone()
         if not admin:
             raise HTTPException(status_code=401, detail="Invalid credentials")
-        
-        token = generate_jwt(admin['username'], role='admin')
         return {
-            "message": "Login successful",
-            "jwt_token": token,
-            "user": {"username": admin['username'], "role": "admin"}
+            "message":   "Login successful",
+            "jwt_token": generate_jwt(admin['username'], role='admin'),
+            "user":      {"username": admin['username'], "role": "admin"}
         }
     finally:
         conn.close()
@@ -216,21 +192,24 @@ def admin_login(req: AdminLoginRequest):
 @app.get("/api/admin/forms")
 def get_all_forms(admin=Depends(get_current_admin)):
     conn = get_db_connection()
-    if not conn: raise HTTPException(status_code=500, detail="Database connection failed")
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
     try:
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT * FROM forms")
-            return cursor.fetchall()
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM forms")
+            return cur.fetchall()
     finally:
         conn.close()
 
 @app.post("/api/admin/forms", status_code=201)
 def add_form(req: FormRequest, admin=Depends(get_current_admin)):
     conn = get_db_connection()
-    if not conn: raise HTTPException(status_code=500, detail="Database connection failed")
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
     try:
-        with conn.cursor() as cursor:
-            cursor.execute("INSERT INTO forms (division, name, url) VALUES (%s,%s,%s)", (req.division, req.name, req.url))
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO forms (division, name, url) VALUES (%s,%s,%s)",
+                        (req.division, req.name, req.url))
         conn.commit()
         return {"message": "Form added successfully"}
     finally:
@@ -239,10 +218,12 @@ def add_form(req: FormRequest, admin=Depends(get_current_admin)):
 @app.put("/api/admin/forms/{form_id}")
 def update_form(form_id: int, req: FormRequest, admin=Depends(get_current_admin)):
     conn = get_db_connection()
-    if not conn: raise HTTPException(status_code=500, detail="Database connection failed")
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
     try:
-        with conn.cursor() as cursor:
-            cursor.execute("UPDATE forms SET division=%s, name=%s, url=%s WHERE id=%s", (req.division, req.name, req.url, form_id))
+        with conn.cursor() as cur:
+            cur.execute("UPDATE forms SET division=%s, name=%s, url=%s WHERE id=%s",
+                        (req.division, req.name, req.url, form_id))
         conn.commit()
         return {"message": "Form updated successfully"}
     finally:
@@ -251,10 +232,11 @@ def update_form(form_id: int, req: FormRequest, admin=Depends(get_current_admin)
 @app.delete("/api/admin/forms/{form_id}")
 def delete_form(form_id: int, admin=Depends(get_current_admin)):
     conn = get_db_connection()
-    if not conn: raise HTTPException(status_code=500, detail="Database connection failed")
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
     try:
-        with conn.cursor() as cursor:
-            cursor.execute("DELETE FROM forms WHERE id=%s", (form_id,))
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM forms WHERE id=%s", (form_id,))
         conn.commit()
         return {"message": "Form deleted successfully"}
     finally:
@@ -263,62 +245,60 @@ def delete_form(form_id: int, admin=Depends(get_current_admin)):
 @app.get("/api/admin/tokens")
 def get_all_tokens(admin=Depends(get_current_admin)):
     conn = get_db_connection()
-    if not conn: raise HTTPException(status_code=500, detail="Database connection failed")
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
     try:
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT t.id, t.employee_id, e.division, t.token FROM employee_tokens t JOIN employees e ON t.employee_id = e.employee_id")
-            tokens = cursor.fetchall()
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, employee_id, division, token FROM auto_login_tokens")
+            tokens = cur.fetchall()
         for t in tokens:
-            t['portal_url'] = f"http://localhost:5173/auth?data={t['token']}"
-            t['data_param'] = t['token']
+            b64 = b64lib.b64encode(t['employee_id'].encode()).decode()
+            t['portal_url']  = f"https://jotfrom.vercel.app/auth?data={b64}"
+            t['data_param']  = b64
         return tokens
     finally:
         conn.close()
 
+# ─── Employee Routes ──────────────────────────────────────────────────────────
 @app.post("/api/employee/login")
 def employee_login(req: EmployeeLoginRequest):
+    """
+    Accepts { "token": "<base64_of_employee_id>" }
+    Decodes the Base64 → employee_id
+    Looks up auto_login_tokens by employee_id
+    Returns JWT + employee data
+    """
     if not req.token:
         raise HTTPException(status_code=400, detail="token is required")
 
-    conn = get_db_connection()
-    if not conn: raise HTTPException(status_code=500, detail="Database connection failed")
+    # Decode Base64 → employee_id
     try:
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT * FROM employee_tokens WHERE token=%s", (req.token,))
-            token_record = cursor.fetchone()
-        
-        if not token_record:
-            raise HTTPException(status_code=401, detail="Invalid or expired token")
-            
-        if token_record['is_used']:
-            raise HTTPException(status_code=401, detail="Invalid or expired token")
-            
-        if token_record['expires_at'] < datetime.datetime.now():
+        employee_id = b64lib.b64decode(req.token + "==").decode('utf-8').strip()
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM auto_login_tokens WHERE employee_id=%s",
+                (employee_id,)
+            )
+            record = cur.fetchone()
+
+        if not record:
             raise HTTPException(status_code=401, detail="Invalid or expired token")
 
-        try:
-            employee_id = b64lib.b64decode(req.token).decode('utf-8').strip()
-        except:
+        # expires_at check (already set to 2099, just a safety guard)
+        if record['expires_at'] < datetime.datetime.now():
             raise HTTPException(status_code=401, detail="Invalid or expired token")
 
-        if employee_id != token_record['employee_id']:
-            raise HTTPException(status_code=401, detail="Invalid or expired token")
-
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT * FROM employees WHERE employee_id=%s", (employee_id,))
-            emp = cursor.fetchone()
-        
-        if not emp:
-            raise HTTPException(status_code=401, detail="Invalid or expired token")
-            
-        # Note: Marking as used is optional. We skip it here to allow permanent link usage 
-        # based on the user's previous request. But if desired, it would be:
-        # cursor.execute("UPDATE employee_tokens SET is_used=1, used_at=CURRENT_TIMESTAMP WHERE id=%s", (token_record['id'],))
-        # conn.commit()
-        
-        jwt_token = generate_jwt(emp['employee_id'], role='employee', division=emp['division'])
+        jwt_token = generate_jwt(record['employee_id'], role='employee',
+                                 division=record['division'])
         return {
-            "employee": {"employee_id": emp['employee_id'], "division": emp['division']},
+            "employee":  {"employee_id": record['employee_id'], "division": record['division']},
             "jwt_token": jwt_token
         }
     finally:
@@ -327,19 +307,19 @@ def employee_login(req: EmployeeLoginRequest):
 @app.get("/api/employee/forms")
 def get_employee_forms(division: str, authorization: Optional[str] = Header(None)):
     if authorization and authorization.startswith("Bearer "):
-        token = authorization[7:]
-        payload = verify_jwt(token)
+        payload = verify_jwt(authorization[7:])
         if not payload:
             raise HTTPException(status_code=401, detail="Session expired")
         if payload.get('division') != division:
             raise HTTPException(status_code=403, detail="Division mismatch")
 
     conn = get_db_connection()
-    if not conn: raise HTTPException(status_code=500, detail="Database connection failed")
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
     try:
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT * FROM forms WHERE division=%s", (division,))
-            return cursor.fetchall()
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM forms WHERE division=%s", (division,))
+            return cur.fetchall()
     finally:
         conn.close()
 
