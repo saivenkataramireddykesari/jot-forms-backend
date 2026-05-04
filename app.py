@@ -262,12 +262,6 @@ def get_all_tokens(admin=Depends(get_current_admin)):
 # ─── Employee Routes ──────────────────────────────────────────────────────────
 @app.post("/api/employee/login")
 def employee_login(req: EmployeeLoginRequest):
-    """
-    Accepts { "token": "<base64_of_employee_id>" }
-    Decodes the Base64 → employee_id
-    Looks up auto_login_tokens by employee_id
-    Returns JWT + employee data
-    """
     if not req.token:
         raise HTTPException(status_code=400, detail="token is required")
 
@@ -275,28 +269,32 @@ def employee_login(req: EmployeeLoginRequest):
     if not conn:
         raise HTTPException(status_code=500, detail="Database connection failed")
     try:
+        clean_token = req.token.strip()
         with conn.cursor() as cur:
-            # 1. Try searching by the raw token as EITHER the employee_id OR the token column
-            cur.execute("SELECT * FROM auto_login_tokens WHERE employee_id=%s OR token=%s", (req.token, req.token))
+            # 1. Try raw match on either column
+            cur.execute("SELECT * FROM auto_login_tokens WHERE employee_id=%s OR token=%s", (clean_token, clean_token))
             record = cur.fetchone()
             
-            # 2. If not found, it might be a Base64 encoded ID (for ?data=RU1QMTAwMQ==)
+            # 2. Try decoded match if not found
             if not record:
                 try:
-                    # Pad correctly and decode
-                    padded_token = req.token + "=" * (4 - len(req.token) % 4) if len(req.token) % 4 else req.token
-                    decoded_id = b64lib.b64decode(padded_token).decode('utf-8').strip()
-                    cur.execute("SELECT * FROM auto_login_tokens WHERE employee_id=%s", (decoded_id,))
+                    # Normalize padding for Base64
+                    raw_b64 = clean_token.rstrip('=')
+                    padded = raw_b64 + "=" * ((4 - len(raw_b64) % 4) % 4)
+                    decoded_id = b64lib.b64decode(padded).decode('utf-8').strip()
+                    cur.execute("SELECT * FROM auto_login_tokens WHERE employee_id=%s OR token=%s", (decoded_id, decoded_id))
                     record = cur.fetchone()
                 except Exception:
                     pass
 
         if not record:
-            raise HTTPException(status_code=401, detail="Invalid or expired token")
+            raise HTTPException(status_code=401, detail="Token not found")
 
-        # expires_at check (already set to 2099, just a safety guard)
+        if record['is_used']:
+            raise HTTPException(status_code=401, detail="Token already used")
+            
         if record['expires_at'] < datetime.datetime.now():
-            raise HTTPException(status_code=401, detail="Invalid or expired token")
+            raise HTTPException(status_code=401, detail="Token expired")
 
         jwt_token = generate_jwt(record['employee_id'], role='employee',
                                  division=record['division'])
