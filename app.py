@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, Header
+from fastapi import FastAPI, Depends, HTTPException, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
@@ -7,10 +7,15 @@ import base64 as b64lib
 import jwt
 import datetime
 import os
+import logging
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
 
 load_dotenv()
+
+# ─── Logging Configuration ──────────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # ─── JWT Config (no expiry) ───────────────────────────────────────────────────
 JWT_SECRET = 'emp_portal_super_secret_2024'
@@ -260,8 +265,97 @@ def get_all_tokens(admin=Depends(get_current_admin)):
         conn.close()
 
 # ─── Employee Routes ──────────────────────────────────────────────────────────
+
+@app.get("/auth")
+def auth_endpoint(data: str = Query(..., description="Base64 encoded employee_id")):
+    """
+    Auto-login endpoint that validates token from URL query parameter.
+    
+    URL format: /auth?data=RU1QMTAwNg==
+    
+    Returns:
+        - 200: {"employee_id": "...", "division": "..."}
+        - 401: Invalid, expired, or already used token
+    """
+    logger.info(f"[AUTH] Received data parameter: {data}")
+    
+    if not data or not data.strip():
+        logger.warning("[AUTH] Empty data parameter")
+        raise HTTPException(status_code=401, detail="Invalid token: data parameter is required")
+    
+    # Decode Base64 to get employee_id
+    try:
+        clean_b64 = data.strip()
+        # Normalize padding for Base64
+        raw_b64 = clean_b64.rstrip('=')
+        padded = raw_b64 + "=" * ((4 - len(raw_b64) % 4) % 4)
+        employee_id = b64lib.b64decode(padded).decode('utf-8').strip()
+        logger.info(f"[AUTH] Decoded employee_id: {employee_id}")
+    except Exception as e:
+        logger.error(f"[AUTH] Base64 decode failed: {e}, data={data}")
+        raise HTTPException(status_code=401, detail="Invalid token: malformed data")
+    
+    # Database lookup with proper filters
+    conn = get_db_connection()
+    if not conn:
+        logger.error("[AUTH] Database connection failed")
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    
+    try:
+        with conn.cursor() as cur:
+            # CRITICAL: Use exact match on employee_id, filter unused & non-expired tokens
+            # Use %s placeholders (PyMySQL style), NOT ?
+            # Use fetchone() to get single row, NOT fetchall()
+            sql = """
+                SELECT employee_id, division, is_used, expires_at
+                FROM auto_login_tokens
+                WHERE employee_id = %s
+                  AND is_used = 0
+                  AND expires_at > NOW()
+                LIMIT 1
+            """
+            logger.info(f"[AUTH] Executing SQL: {sql.strip()} with param: {employee_id}")
+            cur.execute(sql, (employee_id,))
+            record = cur.fetchone()
+            
+            logger.info(f"[AUTH] DB Result: {record}")
+            
+            if not record:
+                logger.warning(f"[AUTH] No valid token found for employee_id: {employee_id}")
+                raise HTTPException(status_code=401, detail="Invalid or expired token")
+            
+            # Double-check the values (defensive programming)
+            if record.get('is_used'):
+                logger.warning(f"[AUTH] Token already used for: {employee_id}")
+                raise HTTPException(status_code=401, detail="Token already used")
+            
+            expires_at = record.get('expires_at')
+            if expires_at and expires_at < datetime.datetime.now():
+                logger.warning(f"[AUTH] Token expired for: {employee_id}, expires_at={expires_at}")
+                raise HTTPException(status_code=401, detail="Token expired")
+            
+            result = {
+                "employee_id": record['employee_id'],
+                "division": record['division']
+            }
+            logger.info(f"[AUTH] Success: {result}")
+            return result
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[AUTH] Database error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+    finally:
+        conn.close()
+
+
 @app.post("/api/employee/login")
 def employee_login(req: EmployeeLoginRequest):
+    """
+    Legacy login endpoint - kept for backward compatibility.
+    Uses token-based lookup with is_used and expires_at checks.
+    """
     if not req.token:
         raise HTTPException(status_code=400, detail="token is required")
 
@@ -270,22 +364,45 @@ def employee_login(req: EmployeeLoginRequest):
         raise HTTPException(status_code=500, detail="Database connection failed")
     try:
         clean_token = req.token.strip()
+        logger.info(f"[LEGACY LOGIN] Token: {clean_token}")
+        
         with conn.cursor() as cur:
-            # 1. Try raw match on either column
-            cur.execute("SELECT * FROM auto_login_tokens WHERE employee_id=%s OR token=%s", (clean_token, clean_token))
+            # FIXED: Use exact token match with proper filters in SQL
+            cur.execute(
+                """
+                SELECT * FROM auto_login_tokens
+                WHERE token = %s
+                  AND is_used = 0
+                  AND expires_at > NOW()
+                LIMIT 1
+                """,
+                (clean_token,)
+            )
             record = cur.fetchone()
+            logger.info(f"[LEGACY LOGIN] Raw token match: {record}")
             
-            # 2. Try decoded match if not found
+            # 2. Try decoded match if not found (for Base64 encoded employee_ids)
             if not record:
                 try:
-                    # Normalize padding for Base64
                     raw_b64 = clean_token.rstrip('=')
                     padded = raw_b64 + "=" * ((4 - len(raw_b64) % 4) % 4)
                     decoded_id = b64lib.b64decode(padded).decode('utf-8').strip()
-                    cur.execute("SELECT * FROM auto_login_tokens WHERE employee_id=%s OR token=%s", (decoded_id, decoded_id))
+                    logger.info(f"[LEGACY LOGIN] Decoded ID: {decoded_id}")
+                    
+                    cur.execute(
+                        """
+                        SELECT * FROM auto_login_tokens
+                        WHERE employee_id = %s
+                          AND is_used = 0
+                          AND expires_at > NOW()
+                        LIMIT 1
+                        """,
+                        (decoded_id,)
+                    )
                     record = cur.fetchone()
-                except Exception:
-                    pass
+                    logger.info(f"[LEGACY LOGIN] Decoded match: {record}")
+                except Exception as e:
+                    logger.warning(f"[LEGACY LOGIN] Decode failed: {e}")
 
         if not record:
             raise HTTPException(status_code=401, detail="Token not found")
