@@ -45,9 +45,18 @@ def get_db_connection():
         return None
 
 def get_forms_db_connection():
+    """
+    Connect to the forms database.
+    - Locally: uses FORMS_DB_* env vars (pointing to Aiven)
+    - On Render/Production: falls back to main DB config (DB_* vars already point to Aiven)
+    """
+    forms_host = os.getenv('FORMS_DB_HOST')
+    if not forms_host:
+        # Fallback: use main db_config (works on Render where DB_* = Aiven)
+        return get_db_connection()
     try:
         cfg = {
-            'host':         os.getenv('FORMS_DB_HOST'),
+            'host':         forms_host,
             'port':         int(os.getenv('FORMS_DB_PORT', 3306)),
             'user':         os.getenv('FORMS_DB_USER'),
             'password':     os.getenv('FORMS_DB_PASSWORD'),
