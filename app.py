@@ -27,7 +27,7 @@ db_config = {
     'port':         int(os.getenv('DB_PORT', 3306)),
     'user':         os.getenv('DB_USER', 'root'),
     'password':     os.getenv('DB_PASSWORD', ''),
-    'database':     os.getenv('DB_NAME', 'employee_portal_db'),
+    'database':     os.getenv('DB_NAME', 'form_management'),
     'cursorclass':  pymysql.cursors.DictCursor,
     'connect_timeout': 10,
     'charset':      'utf8mb4'
@@ -60,16 +60,16 @@ def get_forms_db_connection():
             'port':         int(os.getenv('FORMS_DB_PORT', 3306)),
             'user':         os.getenv('FORMS_DB_USER'),
             'password':     os.getenv('FORMS_DB_PASSWORD'),
-            'database':     os.getenv('FORMS_DB_NAME'),
+            'database':     os.getenv('FORMS_DB_NAME', os.getenv('DB_NAME', 'form_management')),
             'cursorclass':  pymysql.cursors.DictCursor,
             'connect_timeout': 10,
             'charset':      'utf8mb4'
         }
-        if os.getenv('FORMS_DB_SSL') == 'REQUIRED':
+        if os.getenv('FORMS_DB_SSL') == 'REQUIRED' or os.getenv('DB_SSL_MODE') == 'REQUIRED':
             cfg['ssl'] = {'ssl': True}
         return pymysql.connect(**cfg)
     except Exception as e:
-        print(f"[FORMS DB ERROR] {e}")
+        logger.error(f"[FORMS DB ERROR] {e}")
         return None
 
 def init_db():
@@ -81,7 +81,7 @@ def init_db():
                 temp_cfg['ssl'] = db_config['ssl']
             conn = pymysql.connect(**temp_cfg)
             with conn.cursor() as cur:
-                db_name = os.getenv('DB_NAME', 'employee_portal_db')
+                db_name = os.getenv('DB_NAME', 'form_management')
                 cur.execute(f"CREATE DATABASE IF NOT EXISTS {db_name}")
             conn.commit()
             conn.close()
@@ -200,8 +200,8 @@ app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=["*", "https://jotform-pulse.netlify.app", "https://jotfrom.vercel.app"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -247,6 +247,13 @@ def get_all_forms(admin=Depends(get_current_admin)):
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM forms")
             return cur.fetchall()
+    except pymysql.err.ProgrammingError as e:
+        logger.error(f"[ADMIN FORMS DB ERROR] {e}")
+        # Return empty list or error if table doesn't exist
+        raise HTTPException(status_code=500, detail=f"Database error: 'forms' table might be missing. Details: {e}")
+    except Exception as e:
+        logger.error(f"[ADMIN FORMS UNKNOWN ERROR] {e}")
+        raise HTTPException(status_code=500, detail="Internal server error while fetching forms")
     finally:
         conn.close()
 
@@ -499,6 +506,12 @@ def get_employee_forms(division: str, authorization: Optional[str] = Header(None
             # Use case-insensitive matching for division
             cur.execute("SELECT * FROM forms WHERE LOWER(division) = LOWER(%s)", (division,))
             return cur.fetchall()
+    except pymysql.err.ProgrammingError as e:
+        logger.error(f"[EMPLOYEE FORMS DB ERROR] {e}")
+        raise HTTPException(status_code=500, detail=f"Database error: 'forms' table might be missing. Details: {e}")
+    except Exception as e:
+        logger.error(f"[EMPLOYEE FORMS UNKNOWN ERROR] {e}")
+        raise HTTPException(status_code=500, detail="Internal server error while fetching employee forms")
     finally:
         conn.close()
 
