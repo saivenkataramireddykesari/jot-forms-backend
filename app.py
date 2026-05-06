@@ -116,34 +116,15 @@ def init_db():
                 url      VARCHAR(500) NOT NULL
             )""")
 
-            # ── auto_login_tokens (single source of truth for employees) ──────
+            # ── employees (single source of truth for employees) ──────
             cur.execute("""
-            CREATE TABLE IF NOT EXISTS auto_login_tokens (
+            CREATE TABLE IF NOT EXISTS employees (
                 id          INT AUTO_INCREMENT PRIMARY KEY,
-                employee_id VARCHAR(50)  NOT NULL,
-                token       VARCHAR(255) NOT NULL UNIQUE,
-                is_used     TINYINT(1)   DEFAULT 0,
-                created_at  TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
-                expires_at  DATETIME     NOT NULL,
-                used_at     DATETIME,
+                employee_id VARCHAR(50)  NOT NULL UNIQUE,
                 division    VARCHAR(50)  NOT NULL
             )""")
 
-            # Seed default employees if table is empty
-            cur.execute("SELECT COUNT(*) as cnt FROM auto_login_tokens")
-            if cur.fetchone()['cnt'] == 0:
-                seeds = [
-                    ('EMP1001', 'tok_EMP1001_maxmus',   'maxmus'),
-                    ('EMP1002', 'tok_EMP1002_nucles',   'nucles'),
-                    ('EMP1003', 'tok_EMP1003_gladius',  'gladius'),
-                    ('EMP1004', 'tok_EMP1004_stimulas', 'stimulas'),
-                    ('EMP1005', 'tok_EMP1005_glamus',   'glamus'),
-                    ('EMP1006', 'tok_EMP1006_nutrius',  'nutrius'),
-                ]
-                cur.executemany(
-                    "INSERT INTO auto_login_tokens (employee_id, token, expires_at, division) VALUES (%s,%s,'2099-12-31 23:59:59',%s)",
-                    seeds
-                )
+
 
         conn.commit()
         conn.close()
