@@ -116,15 +116,21 @@ def init_db():
                 url      VARCHAR(500) NOT NULL
             )""")
 
-            # ── employees (single source of truth for employees) ──────
+            # ── employees ──
             cur.execute("""
             CREATE TABLE IF NOT EXISTS employees (
-                id          INT AUTO_INCREMENT PRIMARY KEY,
-                employee_id VARCHAR(50)  NOT NULL UNIQUE,
-                division    VARCHAR(50)  NOT NULL
+                id       INT AUTO_INCREMENT PRIMARY KEY,
+                Emp_Code VARCHAR(50)  NOT NULL UNIQUE,
+                Division VARCHAR(50)  NOT NULL
             )""")
 
-
+            # ── forms column discovery ──
+            try:
+                cur.execute("SHOW COLUMNS FROM forms")
+                cols = [row['Field'] for row in cur.fetchall()]
+                logger.info(f"[DB DISCOVERY] 'forms' table columns: {cols}")
+            except Exception as e:
+                logger.warning(f"[DB DISCOVERY] Could not list 'forms' columns: {e}")
 
         conn.commit()
         conn.close()
@@ -227,7 +233,10 @@ def get_all_forms(admin=Depends(get_current_admin)):
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM forms")
-            return cur.fetchall()
+            records = cur.fetchall()
+            if records:
+                logger.info(f"[ADMIN FORMS] Sample record keys: {list(records[0].keys())}")
+            return records
     except pymysql.err.ProgrammingError as e:
         logger.error(f"[ADMIN FORMS DB ERROR] {e}")
         # Return empty list or error if table doesn't exist
