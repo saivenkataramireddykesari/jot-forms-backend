@@ -286,13 +286,24 @@ def get_all_tokens(admin=Depends(get_current_admin)):
         raise HTTPException(status_code=500, detail="Database connection failed")
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT id, employee_id, division, token FROM auto_login_tokens")
-            tokens = cur.fetchall()
-        for t in tokens:
-            b64 = b64lib.b64encode(t['employee_id'].encode()).decode()
-            t['portal_url']  = f"https://jotfrom.vercel.app/auth?data={b64}"
-            t['data_param']  = b64
+            cur.execute("SELECT id, employee_id, division FROM employees")
+            employees = cur.fetchall()
+            
+        tokens = []
+        for emp in employees:
+            b64 = b64lib.b64encode(emp['employee_id'].encode()).decode()
+            tokens.append({
+                "id": emp['id'],
+                "employee_id": emp['employee_id'],
+                "division": emp['division'],
+                "token": b64,
+                "portal_url": f"https://jotfrom.vercel.app/auth?data={b64}",
+                "data_param": b64
+            })
         return tokens
+    except Exception as e:
+        logger.error(f"[ADMIN TOKENS ERROR] {e}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
     finally:
         conn.close()
 
@@ -300,94 +311,45 @@ def get_all_tokens(admin=Depends(get_current_admin)):
 
 @app.get("/auth")
 def auth_endpoint(data: str = Query(..., description="Base64 encoded employee_id")):
-    """
-    Auto-login endpoint that validates token from URL query parameter.
-    
-    URL format: /auth?data=RU1QMTAwNg==
-    
-    Returns:
-        - 200: {"employee_id": "...", "division": "..."}
-        - 401: Invalid, expired, or already used token
-    """
     logger.info(f"[AUTH] Received data parameter: {data}")
-    
     if not data or not data.strip():
-        logger.warning("[AUTH] Empty data parameter")
         raise HTTPException(status_code=401, detail="Invalid token: data parameter is required")
     
-    # Decode Base64 to get employee_id
     try:
         clean_b64 = data.strip()
-        # Normalize padding for Base64
         raw_b64 = clean_b64.rstrip('=')
         padded = raw_b64 + "=" * ((4 - len(raw_b64) % 4) % 4)
         employee_id = b64lib.b64decode(padded).decode('utf-8').strip()
-        logger.info(f"[AUTH] Decoded employee_id: {employee_id}")
     except Exception as e:
-        logger.error(f"[AUTH] Base64 decode failed: {e}, data={data}")
+        logger.error(f"[AUTH] Base64 decode failed: {e}")
         raise HTTPException(status_code=401, detail="Invalid token: malformed data")
     
-    # Database lookup with proper filters
     conn = get_db_connection()
     if not conn:
-        logger.error("[AUTH] Database connection failed")
         raise HTTPException(status_code=500, detail="Database connection failed")
     
     try:
         with conn.cursor() as cur:
-            # CRITICAL: Use exact match on employee_id, filter unused & non-expired tokens
-            # Use %s placeholders (PyMySQL style), NOT ?
-            # Use fetchone() to get single row, NOT fetchall()
-            sql = """
-                SELECT employee_id, division, is_used, expires_at
-                FROM auto_login_tokens
-                WHERE employee_id = %s
-                  AND is_used = 0
-                  AND expires_at > NOW()
-                LIMIT 1
-            """
-            logger.info(f"[AUTH] Executing SQL: {sql.strip()} with param: {employee_id}")
-            cur.execute(sql, (employee_id,))
+            cur.execute("SELECT employee_id, division FROM employees WHERE employee_id = %s LIMIT 1", (employee_id,))
             record = cur.fetchone()
-            
-            logger.info(f"[AUTH] DB Result: {record}")
-            
             if not record:
-                logger.warning(f"[AUTH] No valid token found for employee_id: {employee_id}")
-                raise HTTPException(status_code=401, detail="Invalid or expired token")
+                raise HTTPException(status_code=401, detail="Invalid employee ID")
             
-            # Double-check the values (defensive programming)
-            if record.get('is_used'):
-                logger.warning(f"[AUTH] Token already used for: {employee_id}")
-                raise HTTPException(status_code=401, detail="Token already used")
-            
-            expires_at = record.get('expires_at')
-            if expires_at and expires_at < datetime.datetime.now():
-                logger.warning(f"[AUTH] Token expired for: {employee_id}, expires_at={expires_at}")
-                raise HTTPException(status_code=401, detail="Token expired")
-            
-            result = {
-                "employee_id": record['employee_id'],
-                "division": record['division']
-            }
-            logger.info(f"[AUTH] Success: {result}")
-            return result
-            
+            return {"employee_id": record['employee_id'], "division": record['division']}
     except HTTPException:
         raise
+    except pymysql.err.ProgrammingError as e:
+        logger.error(f"[AUTH DB ERROR] {e}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
     except Exception as e:
-        logger.error(f"[AUTH] Database error: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
+        logger.error(f"[AUTH UNKNOWN ERROR] {e}")
+        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
     finally:
         conn.close()
 
 
 @app.post("/api/employee/login")
 def employee_login(req: EmployeeLoginRequest):
-    """
-    Legacy login endpoint - kept for backward compatibility.
-    Uses token-based lookup with is_used and expires_at checks.
-    """
     if not req.token:
         raise HTTPException(status_code=400, detail="token is required")
 
@@ -396,77 +358,35 @@ def employee_login(req: EmployeeLoginRequest):
         raise HTTPException(status_code=500, detail="Database connection failed")
     try:
         clean_token = req.token.strip()
-        logger.info(f"[LEGACY LOGIN] Token: {clean_token}")
+        decoded_id = None
+        try:
+            raw_b64 = clean_token.rstrip('=')
+            if len(raw_b64) % 4 != 1:
+                padded = raw_b64 + "=" * ((4 - len(raw_b64) % 4) % 4)
+                decoded_id = b64lib.b64decode(padded).decode('utf-8').strip()
+        except: pass
+
+        search_ids = [clean_token]
+        if decoded_id: search_ids.append(decoded_id)
         
         with conn.cursor() as cur:
-            # 1. Try auto_login_tokens if it exists
-            record = None
-            try:
-                cur.execute(
-                    """
-                    SELECT * FROM auto_login_tokens
-                    WHERE (token = %s OR employee_id = %s)
-                      AND is_used = 0
-                      AND expires_at > NOW()
-                    LIMIT 1
-                    """,
-                    (clean_token, clean_token)
-                )
-                record = cur.fetchone()
-            except Exception as e:
-                logger.info(f"[LOGIN] auto_login_tokens check skipped: {e}")
-
-            # 2. Handle Decoded ID or Plain Text
-            decoded_id = None
-            try:
-                raw_b64 = clean_token.rstrip('=')
-                if len(raw_b64) % 4 != 1:  # Only attempt if length is valid for B64
-                    padded = raw_b64 + "=" * ((4 - len(raw_b64) % 4) % 4)
-                    decoded_id = b64lib.b64decode(padded).decode('utf-8').strip()
-                    logger.info(f"[LOGIN] Decoded ID: {decoded_id}")
-            except Exception as e:
-                logger.info(f"[LOGIN] Base64 decode skipped/failed: {e}")
-
-            # 3. Final Fallback: Check auto_login_tokens or organogram
-            if not record:
-                # Try auto_login_tokens with decoded ID
-                if decoded_id:
-                    try:
-                        cur.execute(
-                            "SELECT * FROM auto_login_tokens WHERE employee_id = %s AND is_used = 0 AND expires_at > NOW() LIMIT 1",
-                            (decoded_id,)
-                        )
-                        record = cur.fetchone()
-                    except: pass
-                
-                # Check 'organogram' table (User's specific structure)
-                if not record:
-                    # Check both the raw input and the decoded ID (if any)
-                    search_ids = [clean_token]
-                    if decoded_id: search_ids.append(decoded_id)
-                    
-                    logger.info(f"[LOGIN] Checking 'organogram' table for {search_ids}")
-                    cur.execute(
-                        "SELECT Emp_Code as employee_id, Division as division FROM organogram WHERE Emp_Code IN %s LIMIT 1",
-                        (tuple(search_ids),)
-                    )
-                    record = cur.fetchone()
-                    if record:
-                        logger.info(f"[LOGIN] Found in 'organogram' table: {record}")
+            cur.execute("SELECT employee_id, division FROM employees WHERE employee_id IN %s LIMIT 1", (tuple(search_ids),))
+            record = cur.fetchone()
 
         if not record:
             raise HTTPException(status_code=401, detail="Employee ID not found in database")
 
-        # Normalize division for frontend (ensure lowercase if needed, or keep as is)
         div = record['division'].lower().strip() if record['division'] else 'unknown'
-        
-        # Create session JWT
-        jwt_token = generate_jwt(record['employee_id'], role='employee',
-                                 division=div)
+        jwt_token = generate_jwt(record['employee_id'], role='employee', division=div)
         return {
-            "employee":  {"employee_id": record['employee_id'], "division": div},
+            "employee": {"employee_id": record['employee_id'], "division": div},
             "jwt_token": jwt_token
         }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[LOGIN ERROR] {e}")
+        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
     finally:
         conn.close()
 
