@@ -249,6 +249,12 @@ def add_form(req: FormRequest, admin=Depends(get_current_admin)):
                         (req.division, req.name, req.url))
         conn.commit()
         return {"message": "Form added successfully"}
+    except pymysql.err.ProgrammingError as e:
+        logger.error(f"[ADD FORM DB ERROR] {e}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}. Please check if 'forms' table and columns 'division', 'name', 'url' exist.")
+    except Exception as e:
+        logger.error(f"[ADD FORM ERROR] {e}")
+        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
     finally:
         conn.close()
 
@@ -263,6 +269,9 @@ def update_form(form_id: int, req: FormRequest, admin=Depends(get_current_admin)
                         (req.division, req.name, req.url, form_id))
         conn.commit()
         return {"message": "Form updated successfully"}
+    except Exception as e:
+        logger.error(f"[UPDATE FORM ERROR] {e}")
+        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
     finally:
         conn.close()
 
@@ -276,6 +285,9 @@ def delete_form(form_id: int, admin=Depends(get_current_admin)):
             cur.execute("DELETE FROM forms WHERE id=%s", (form_id,))
         conn.commit()
         return {"message": "Form deleted successfully"}
+    except Exception as e:
+        logger.error(f"[DELETE FORM ERROR] {e}")
+        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
     finally:
         conn.close()
 
