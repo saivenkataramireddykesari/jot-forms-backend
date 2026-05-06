@@ -238,15 +238,11 @@ def get_all_forms(admin=Depends(get_current_admin)):
             # Map records to standard 'division', 'name', 'url' for the frontend
             standardized = []
             for r in records:
-                # Find the best match for each field
-                div = r.get('division') or r.get('Division') or 'unknown'
-                name = r.get('name') or r.get('Form_Name') or r.get('Form_Title') or r.get('form_name') or 'Unnamed'
-                url = r.get('url') or r.get('Form_URL') or r.get('form_url') or r.get('URL') or ''
                 standardized.append({
-                    "id": r.get('id') or r.get('ID'),
-                    "division": div,
-                    "name": name,
-                    "url": url
+                    "id": r.get('id'),
+                    "division": r.get('division'),
+                    "name": r.get('form_name'),
+                    "url": r.get('form_url')
                 })
             return standardized
     except Exception as e:
@@ -262,19 +258,8 @@ def add_form(req: FormRequest, admin=Depends(get_current_admin)):
         raise HTTPException(status_code=500, detail="Forms database connection failed")
     try:
         with conn.cursor() as cur:
-            # Dynamic Column Discovery
-            cur.execute("SHOW COLUMNS FROM forms")
-            cols = [row['Field'] for row in cur.fetchall()]
-            logger.info(f"[ADD FORM] ACTUAL COLUMNS in 'forms' table: {cols}")
-            
-            # Find the best matches
-            t_div = next((c for c in cols if c.lower() == 'division'), 'division')
-            t_name = next((c for c in cols if c.lower() in ['name', 'form_name', 'form_title', 'title']), 'name')
-            t_url = next((c for c in cols if c.lower() in ['url', 'form_url', 'link', 'href']), 'url')
-            
-            logger.info(f"[ADD FORM] Selected mapping: div={t_div}, name={t_name}, url={t_url}")
-            
-            cur.execute(f"INSERT INTO forms ({t_div}, {t_name}, {t_url}) VALUES (%s,%s,%s)",
+            # Using exact column names: division, form_name, form_url
+            cur.execute("INSERT INTO forms (division, form_name, form_url) VALUES (%s,%s,%s)",
                         (req.division, req.name, req.url))
         conn.commit()
         return {"message": "Form added successfully"}
@@ -455,24 +440,18 @@ def get_employee_forms(division: str, authorization: Optional[str] = Header(None
         raise HTTPException(status_code=500, detail="Forms database connection failed")
     try:
         with conn.cursor() as cur:
-            # Discover division column name
-            cur.execute("SHOW COLUMNS FROM forms")
-            cols = [row['Field'] for row in cur.fetchall()]
-            t_div = 'Division' if 'Division' in cols else 'division'
-            
-            cur.execute(f"SELECT * FROM forms WHERE LOWER({t_div}) = LOWER(%s)", (division,))
+            # Use exact column names
+            cur.execute("SELECT * FROM forms WHERE LOWER(division) = LOWER(%s)", (division,))
             records = cur.fetchall()
             
             # Standardize for frontend
             standardized = []
             for r in records:
-                name = r.get('name') or r.get('Form_Name') or r.get('Form_Title') or r.get('form_name') or 'Unnamed'
-                url = r.get('url') or r.get('Form_URL') or r.get('form_url') or r.get('URL') or ''
                 standardized.append({
-                    "id": r.get('id') or r.get('ID'),
-                    "division": r.get(t_div),
-                    "name": name,
-                    "url": url
+                    "id": r.get('id'),
+                    "division": r.get('division'),
+                    "name": r.get('form_name'),
+                    "url": r.get('form_url')
                 })
             return standardized
     except Exception as e:
