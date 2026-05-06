@@ -265,12 +265,14 @@ def add_form(req: FormRequest, admin=Depends(get_current_admin)):
             # Dynamic Column Discovery
             cur.execute("SHOW COLUMNS FROM forms")
             cols = [row['Field'] for row in cur.fetchall()]
+            logger.info(f"[ADD FORM] ACTUAL COLUMNS in 'forms' table: {cols}")
             
-            t_div = 'Division' if 'Division' in cols else 'division'
-            t_name = 'Form_Name' if 'Form_Name' in cols else ('name' if 'name' in cols else 'Form_Title')
-            t_url = 'Form_URL' if 'Form_URL' in cols else ('url' if 'url' in cols else 'URL')
+            # Find the best matches
+            t_div = next((c for c in cols if c.lower() == 'division'), 'division')
+            t_name = next((c for c in cols if c.lower() in ['name', 'form_name', 'form_title', 'title']), 'name')
+            t_url = next((c for c in cols if c.lower() in ['url', 'form_url', 'link', 'href']), 'url')
             
-            logger.info(f"[ADD FORM] Using columns: {t_div}, {t_name}, {t_url}")
+            logger.info(f"[ADD FORM] Selected mapping: div={t_div}, name={t_name}, url={t_url}")
             
             cur.execute(f"INSERT INTO forms ({t_div}, {t_name}, {t_url}) VALUES (%s,%s,%s)",
                         (req.division, req.name, req.url))
