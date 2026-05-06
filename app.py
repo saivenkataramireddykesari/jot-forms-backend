@@ -234,16 +234,24 @@ def get_all_forms(admin=Depends(get_current_admin)):
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM forms")
             records = cur.fetchall()
-            if records:
-                logger.info(f"[ADMIN FORMS] Sample record keys: {list(records[0].keys())}")
-            return records
-    except pymysql.err.ProgrammingError as e:
-        logger.error(f"[ADMIN FORMS DB ERROR] {e}")
-        # Return empty list or error if table doesn't exist
-        raise HTTPException(status_code=500, detail=f"Database error: 'forms' table might be missing. Details: {e}")
+            
+            # Map records to standard 'division', 'name', 'url' for the frontend
+            standardized = []
+            for r in records:
+                # Find the best match for each field
+                div = r.get('division') or r.get('Division') or 'unknown'
+                name = r.get('name') or r.get('Form_Name') or r.get('Form_Title') or r.get('form_name') or 'Unnamed'
+                url = r.get('url') or r.get('Form_URL') or r.get('form_url') or r.get('URL') or ''
+                standardized.append({
+                    "id": r.get('id') or r.get('ID'),
+                    "division": div,
+                    "name": name,
+                    "url": url
+                })
+            return standardized
     except Exception as e:
-        logger.error(f"[ADMIN FORMS UNKNOWN ERROR] {e}")
-        raise HTTPException(status_code=500, detail="Internal server error while fetching forms")
+        logger.error(f"[ADMIN FORMS ERROR] {e}")
+        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
     finally:
         conn.close()
 
@@ -254,16 +262,23 @@ def add_form(req: FormRequest, admin=Depends(get_current_admin)):
         raise HTTPException(status_code=500, detail="Forms database connection failed")
     try:
         with conn.cursor() as cur:
-            cur.execute("INSERT INTO forms (division, name, url) VALUES (%s,%s,%s)",
+            # Dynamic Column Discovery
+            cur.execute("SHOW COLUMNS FROM forms")
+            cols = [row['Field'] for row in cur.fetchall()]
+            
+            t_div = 'Division' if 'Division' in cols else 'division'
+            t_name = 'Form_Name' if 'Form_Name' in cols else ('name' if 'name' in cols else 'Form_Title')
+            t_url = 'Form_URL' if 'Form_URL' in cols else ('url' if 'url' in cols else 'URL')
+            
+            logger.info(f"[ADD FORM] Using columns: {t_div}, {t_name}, {t_url}")
+            
+            cur.execute(f"INSERT INTO forms ({t_div}, {t_name}, {t_url}) VALUES (%s,%s,%s)",
                         (req.division, req.name, req.url))
         conn.commit()
         return {"message": "Form added successfully"}
-    except pymysql.err.ProgrammingError as e:
-        logger.error(f"[ADD FORM DB ERROR] {e}")
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}. Please check if 'forms' table and columns 'division', 'name', 'url' exist.")
     except Exception as e:
         logger.error(f"[ADD FORM ERROR] {e}")
-        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
     finally:
         conn.close()
 
@@ -438,15 +453,29 @@ def get_employee_forms(division: str, authorization: Optional[str] = Header(None
         raise HTTPException(status_code=500, detail="Forms database connection failed")
     try:
         with conn.cursor() as cur:
-            # Use case-insensitive matching for division
-            cur.execute("SELECT * FROM forms WHERE LOWER(division) = LOWER(%s)", (division,))
-            return cur.fetchall()
-    except pymysql.err.ProgrammingError as e:
-        logger.error(f"[EMPLOYEE FORMS DB ERROR] {e}")
-        raise HTTPException(status_code=500, detail=f"Database error: 'forms' table might be missing. Details: {e}")
+            # Discover division column name
+            cur.execute("SHOW COLUMNS FROM forms")
+            cols = [row['Field'] for row in cur.fetchall()]
+            t_div = 'Division' if 'Division' in cols else 'division'
+            
+            cur.execute(f"SELECT * FROM forms WHERE LOWER({t_div}) = LOWER(%s)", (division,))
+            records = cur.fetchall()
+            
+            # Standardize for frontend
+            standardized = []
+            for r in records:
+                name = r.get('name') or r.get('Form_Name') or r.get('Form_Title') or r.get('form_name') or 'Unnamed'
+                url = r.get('url') or r.get('Form_URL') or r.get('form_url') or r.get('URL') or ''
+                standardized.append({
+                    "id": r.get('id') or r.get('ID'),
+                    "division": r.get(t_div),
+                    "name": name,
+                    "url": url
+                })
+            return standardized
     except Exception as e:
-        logger.error(f"[EMPLOYEE FORMS UNKNOWN ERROR] {e}")
-        raise HTTPException(status_code=500, detail="Internal server error while fetching employee forms")
+        logger.error(f"[EMPLOYEE FORMS ERROR] {e}")
+        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
     finally:
         conn.close()
 
