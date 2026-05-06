@@ -286,16 +286,21 @@ def get_all_tokens(admin=Depends(get_current_admin)):
         raise HTTPException(status_code=500, detail="Database connection failed")
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT id, employee_id, division FROM employees")
+            # Use actual column names Emp_Code and Division
+            cur.execute("SELECT id, Emp_Code, Division FROM employees")
             employees = cur.fetchall()
             
         tokens = []
         for emp in employees:
-            b64 = b64lib.b64encode(emp['employee_id'].encode()).decode()
+            # Map database Emp_Code to employee_id for the frontend
+            e_id = emp.get('Emp_Code') or emp.get('employee_id')
+            div = emp.get('Division') or emp.get('division')
+            
+            b64 = b64lib.b64encode(e_id.encode()).decode()
             tokens.append({
                 "id": emp['id'],
-                "employee_id": emp['employee_id'],
-                "division": emp['division'],
+                "employee_id": e_id,
+                "division": div,
                 "token": b64,
                 "portal_url": f"https://jotfrom.vercel.app/auth?data={b64}",
                 "data_param": b64
@@ -330,12 +335,16 @@ def auth_endpoint(data: str = Query(..., description="Base64 encoded employee_id
     
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT employee_id, division FROM employees WHERE employee_id = %s LIMIT 1", (employee_id,))
+            # Query using Emp_Code and Division
+            cur.execute("SELECT Emp_Code, Division FROM employees WHERE Emp_Code = %s LIMIT 1", (employee_id,))
             record = cur.fetchone()
             if not record:
                 raise HTTPException(status_code=401, detail="Invalid employee ID")
             
-            return {"employee_id": record['employee_id'], "division": record['division']}
+            return {
+                "employee_id": record.get('Emp_Code') or record.get('employee_id'), 
+                "division": record.get('Division') or record.get('division')
+            }
     except HTTPException:
         raise
     except pymysql.err.ProgrammingError as e:
@@ -370,16 +379,20 @@ def employee_login(req: EmployeeLoginRequest):
         if decoded_id: search_ids.append(decoded_id)
         
         with conn.cursor() as cur:
-            cur.execute("SELECT employee_id, division FROM employees WHERE employee_id IN %s LIMIT 1", (tuple(search_ids),))
+            # Query using Emp_Code and Division
+            cur.execute("SELECT Emp_Code, Division FROM employees WHERE Emp_Code IN %s LIMIT 1", (tuple(search_ids),))
             record = cur.fetchone()
 
         if not record:
             raise HTTPException(status_code=401, detail="Employee ID not found in database")
 
-        div = record['division'].lower().strip() if record['division'] else 'unknown'
-        jwt_token = generate_jwt(record['employee_id'], role='employee', division=div)
+        e_id = record.get('Emp_Code') or record.get('employee_id')
+        div = record.get('Division') or record.get('division')
+        
+        div_clean = div.lower().strip() if div else 'unknown'
+        jwt_token = generate_jwt(e_id, role='employee', division=div_clean)
         return {
-            "employee": {"employee_id": record['employee_id'], "division": div},
+            "employee": {"employee_id": e_id, "division": div_clean},
             "jwt_token": jwt_token
         }
     except HTTPException:
