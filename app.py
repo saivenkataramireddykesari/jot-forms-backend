@@ -95,16 +95,16 @@ def init_db():
             return
 
         with conn.cursor() as cur:
-            # ── admins ────────────────────────────────────────────────────────
+            # ── admin ─────────────────────────────────────────────────────────
             cur.execute("""
-            CREATE TABLE IF NOT EXISTS admins (
+            CREATE TABLE IF NOT EXISTS admin (
                 id       INT AUTO_INCREMENT PRIMARY KEY,
                 username VARCHAR(50)  NOT NULL UNIQUE,
                 password VARCHAR(100) NOT NULL
             )""")
-            cur.execute("SELECT COUNT(*) as cnt FROM admins")
+            cur.execute("SELECT COUNT(*) as cnt FROM admin")
             if cur.fetchone()['cnt'] == 0:
-                cur.execute("INSERT INTO admins (username, password) VALUES (%s,%s)",
+                cur.execute("INSERT INTO admin (username, password) VALUES (%s,%s)",
                             ('admin', 'admin123'))
 
             # ── forms ─────────────────────────────────────────────────────────
@@ -116,9 +116,9 @@ def init_db():
                 url      VARCHAR(500) NOT NULL
             )""")
 
-            # ── employees ──
+            # ── employee ──
             cur.execute("""
-            CREATE TABLE IF NOT EXISTS employees (
+            CREATE TABLE IF NOT EXISTS employee (
                 id       INT AUTO_INCREMENT PRIMARY KEY,
                 Emp_Code VARCHAR(50)  NOT NULL UNIQUE,
                 Division VARCHAR(50)  NOT NULL
@@ -202,7 +202,7 @@ def admin_login(req: AdminLoginRequest):
     try:
         with conn.cursor() as cur:
             try:
-                cur.execute("SELECT * FROM admins WHERE username=%s AND password=%s",
+                cur.execute("SELECT * FROM admin WHERE username=%s AND password=%s",
                             (req.username, req.password))
                 admin = cur.fetchone()
                 if admin:
@@ -241,8 +241,8 @@ def get_all_forms(admin=Depends(get_current_admin)):
                 standardized.append({
                     "id": r.get('id'),
                     "division": r.get('division'),
-                    "name": r.get('form_name'),
-                    "url": r.get('form_url')
+                    "name": r.get('name') or r.get('form_name'),
+                    "url": r.get('url') or r.get('form_url')
                 })
             return standardized
     except Exception as e:
@@ -258,8 +258,8 @@ def add_form(req: FormRequest, admin=Depends(get_current_admin)):
         raise HTTPException(status_code=500, detail="Forms database connection failed")
     try:
         with conn.cursor() as cur:
-            # Using exact column names: division, form_name, form_url
-            cur.execute("INSERT INTO forms (division, form_name, form_url) VALUES (%s,%s,%s)",
+            # Using exact column names: division, name, url
+            cur.execute("INSERT INTO forms (division, name, url) VALUES (%s,%s,%s)",
                         (req.division, req.name, req.url))
         conn.commit()
         return {"message": "Form added successfully"}
@@ -310,7 +310,7 @@ def get_all_tokens(admin=Depends(get_current_admin)):
     try:
         with conn.cursor() as cur:
             # Use actual column names Emp_Code and Division
-            cur.execute("SELECT id, Emp_Code, Division FROM employees")
+            cur.execute("SELECT id, Emp_Code, Division FROM employee")
             employees = cur.fetchall()
             
         tokens = []
@@ -359,7 +359,7 @@ def auth_endpoint(data: str = Query(..., description="Base64 encoded employee_id
     try:
         with conn.cursor() as cur:
             # Query using Emp_Code and Division
-            cur.execute("SELECT Emp_Code, Division FROM employees WHERE Emp_Code = %s LIMIT 1", (employee_id,))
+            cur.execute("SELECT Emp_Code, Division FROM employee WHERE Emp_Code = %s LIMIT 1", (employee_id,))
             record = cur.fetchone()
             if not record:
                 raise HTTPException(status_code=401, detail="Invalid employee ID")
@@ -403,7 +403,7 @@ def employee_login(req: EmployeeLoginRequest):
         
         with conn.cursor() as cur:
             # Query using Emp_Code and Division
-            cur.execute("SELECT Emp_Code, Division FROM employees WHERE Emp_Code IN %s LIMIT 1", (tuple(search_ids),))
+            cur.execute("SELECT Emp_Code, Division FROM employee WHERE Emp_Code IN %s LIMIT 1", (tuple(search_ids),))
             record = cur.fetchone()
 
         if not record:
@@ -450,8 +450,8 @@ def get_employee_forms(division: str, authorization: Optional[str] = Header(None
                 standardized.append({
                     "id": r.get('id'),
                     "division": r.get('division'),
-                    "name": r.get('form_name'),
-                    "url": r.get('form_url')
+                    "name": r.get('name') or r.get('form_name'),
+                    "url": r.get('url') or r.get('form_url')
                 })
             return standardized
     except Exception as e:
