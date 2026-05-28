@@ -4,3 +4,5 @@ pymysql
 PyJWT
 python-dotenv
 pydantic
+gunicorn
+cryptography
