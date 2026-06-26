@@ -113,8 +113,21 @@ def init_db():
                 id       INT AUTO_INCREMENT PRIMARY KEY,
                 division VARCHAR(50)  NOT NULL,
                 name     VARCHAR(100) NOT NULL,
-                url      VARCHAR(500) NOT NULL
+                url      VARCHAR(500) NOT NULL,
+                region   VARCHAR(100) DEFAULT NULL,
+                role     VARCHAR(50) DEFAULT NULL
             )""")
+            try:
+                cur.execute("SHOW COLUMNS FROM forms")
+                cols = [row['Field'] for row in cur.fetchall()]
+                if 'region' not in cols:
+                    cur.execute("ALTER TABLE forms ADD COLUMN region VARCHAR(100) DEFAULT NULL")
+                    logger.info("[DB INIT] Added 'region' column to 'forms' table.")
+                if 'role' not in cols:
+                    cur.execute("ALTER TABLE forms ADD COLUMN role VARCHAR(50) DEFAULT NULL")
+                    logger.info("[DB INIT] Added 'role' column to 'forms' table.")
+            except Exception as e:
+                logger.warning(f"[DB INIT] Could not alter 'forms' table: {e}")
 
             # ── employee ──
             cur.execute("""
@@ -147,16 +160,20 @@ class FormRequest(BaseModel):
     division: str
     name: str
     url: str
+    region: Optional[str] = None
+    role: Optional[str] = None
 
 class EmployeeLoginRequest(BaseModel):
     token: Optional[str] = None
 
 # ─── JWT Helpers ──────────────────────────────────────────────────────────────
-def generate_jwt(user_id: str, role: str = 'employee', division: str = None):
+def generate_jwt(user_id: str, role: str = 'employee', division: str = None, region: str = None, emp_role: str = None):
     payload = {
         'user_id':  user_id,
         'role':     role,
         'division': division,
+        'region':   region,
+        'emp_role': emp_role,
         'iat': datetime.datetime.utcnow(),
         # No 'exp' → token never expires
     }
@@ -235,14 +252,16 @@ def get_all_forms(admin=Depends(get_current_admin)):
             cur.execute("SELECT * FROM forms")
             records = cur.fetchall()
             
-            # Map records to standard 'division', 'name', 'url' for the frontend
+            # Map records to standard 'division', 'name', 'url', 'region', 'role' for the frontend
             standardized = []
             for r in records:
                 standardized.append({
                     "id": r.get('id'),
                     "division": r.get('division'),
                     "name": r.get('name') or r.get('form_name'),
-                    "url": r.get('url') or r.get('form_url')
+                    "url": r.get('url') or r.get('form_url'),
+                    "region": r.get('region'),
+                    "role": r.get('role')
                 })
             return standardized
     except Exception as e:
@@ -258,9 +277,8 @@ def add_form(req: FormRequest, admin=Depends(get_current_admin)):
         raise HTTPException(status_code=500, detail="Forms database connection failed")
     try:
         with conn.cursor() as cur:
-            # Using exact column names: division, name, url
-            cur.execute("INSERT INTO forms (division, name, url) VALUES (%s,%s,%s)",
-                        (req.division, req.name, req.url))
+            cur.execute("INSERT INTO forms (division, name, url, region, role) VALUES (%s,%s,%s,%s,%s)",
+                        (req.division, req.name, req.url, req.region, req.role))
         conn.commit()
         return {"message": "Form added successfully"}
     except Exception as e:
@@ -276,8 +294,8 @@ def update_form(form_id: int, req: FormRequest, admin=Depends(get_current_admin)
         raise HTTPException(status_code=500, detail="Forms database connection failed")
     try:
         with conn.cursor() as cur:
-            cur.execute("UPDATE forms SET division=%s, name=%s, url=%s WHERE id=%s",
-                        (req.division, req.name, req.url, form_id))
+            cur.execute("UPDATE forms SET division=%s, name=%s, url=%s, region=%s, role=%s WHERE id=%s",
+                        (req.division, req.name, req.url, req.region, req.role, form_id))
         conn.commit()
         return {"message": "Form updated successfully"}
     except Exception as e:
@@ -337,6 +355,48 @@ def get_all_tokens(admin=Depends(get_current_admin)):
 
 # ─── Employee Routes ──────────────────────────────────────────────────────────
 
+# ─── Admin Metadata Routes ────────────────────────────────────────────────────
+@app.get("/api/admin/regions")
+def get_regions(division: str, admin=Depends(get_current_admin)):
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT DISTINCT Region FROM employee WHERE LOWER(Division) = LOWER(%s) AND Region IS NOT NULL AND Region != '' ORDER BY Region",
+                (division,)
+            )
+            records = cur.fetchall()
+            regions = [r['Region'] for r in records]
+            return regions
+    except Exception as e:
+        logger.error(f"[GET REGIONS ERROR] {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+@app.get("/api/admin/roles")
+def get_roles(division: str, region: str, admin=Depends(get_current_admin)):
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT DISTINCT Role FROM employee WHERE LOWER(Division) = LOWER(%s) AND LOWER(Region) = LOWER(%s) AND Role IS NOT NULL AND Role != '' ORDER BY Role",
+                (division, region)
+            )
+            records = cur.fetchall()
+            roles = [r['Role'] for r in records]
+            return roles
+    except Exception as e:
+        logger.error(f"[GET ROLES ERROR] {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
 @app.get("/auth")
 def auth_endpoint(data: str = Query(..., description="Base64 encoded employee_id")):
     logger.info(f"[AUTH] Received data parameter: {data}")
@@ -358,15 +418,17 @@ def auth_endpoint(data: str = Query(..., description="Base64 encoded employee_id
     
     try:
         with conn.cursor() as cur:
-            # Query using Emp_Code and Division
-            cur.execute("SELECT Emp_Code, Division FROM employee WHERE Emp_Code = %s LIMIT 1", (employee_id,))
+            # Query using Emp_Code, Division, Region, and Role
+            cur.execute("SELECT Emp_Code, Division, Region, Role FROM employee WHERE Emp_Code = %s LIMIT 1", (employee_id,))
             record = cur.fetchone()
             if not record:
                 raise HTTPException(status_code=401, detail="Invalid employee ID")
             
             return {
-                "employee_id": record.get('Emp_Code') or record.get('employee_id'), 
-                "division": record.get('Division') or record.get('division')
+                "employee_id": record.get('Emp_Code'), 
+                "division": record.get('Division'),
+                "region": record.get('Region'),
+                "role": record.get('Role')
             }
     except HTTPException:
         raise
@@ -402,20 +464,25 @@ def employee_login(req: EmployeeLoginRequest):
         if decoded_id: search_ids.append(decoded_id)
         
         with conn.cursor() as cur:
-            # Query using Emp_Code and Division
-            cur.execute("SELECT Emp_Code, Division FROM employee WHERE Emp_Code IN %s LIMIT 1", (tuple(search_ids),))
+            # Query using Emp_Code, Division, Region, Role
+            cur.execute("SELECT Emp_Code, Division, Region, Role FROM employee WHERE Emp_Code IN %s LIMIT 1", (tuple(search_ids),))
             record = cur.fetchone()
 
         if not record:
             raise HTTPException(status_code=401, detail="Employee ID not found in database")
 
-        e_id = record.get('Emp_Code') or record.get('employee_id')
-        div = record.get('Division') or record.get('division')
+        e_id = record.get('Emp_Code')
+        div = record.get('Division')
+        region = record.get('Region')
+        emp_role = record.get('Role')
         
         div_clean = div.lower().strip() if div else 'unknown'
-        jwt_token = generate_jwt(e_id, role='employee', division=div_clean)
+        region_clean = region.strip() if region else None
+        role_clean = emp_role.strip() if emp_role else None
+
+        jwt_token = generate_jwt(e_id, role='employee', division=div_clean, region=region_clean, emp_role=role_clean)
         return {
-            "employee": {"employee_id": e_id, "division": div_clean},
+            "employee": {"employee_id": e_id, "division": div_clean, "region": region_clean, "role": role_clean},
             "jwt_token": jwt_token
         }
     except HTTPException:
@@ -428,20 +495,34 @@ def employee_login(req: EmployeeLoginRequest):
 
 @app.get("/api/employee/forms")
 def get_employee_forms(division: str, authorization: Optional[str] = Header(None)):
+    emp_region = None
+    emp_role = None
     if authorization and authorization.startswith("Bearer "):
         payload = verify_jwt(authorization[7:])
         if not payload:
             raise HTTPException(status_code=401, detail="Session expired")
         if payload.get('division') != division:
             raise HTTPException(status_code=403, detail="Division mismatch")
+        emp_region = payload.get('region')
+        emp_role = payload.get('emp_role')
 
     conn = get_forms_db_connection()
     if not conn:
         raise HTTPException(status_code=500, detail="Forms database connection failed")
     try:
         with conn.cursor() as cur:
-            # Use exact column names
-            cur.execute("SELECT * FROM forms WHERE LOWER(division) = LOWER(%s)", (division,))
+            # Query dynamically filtering by division, region, and role
+            query = "SELECT * FROM forms WHERE LOWER(division) = LOWER(%s)"
+            params = [division]
+            
+            if emp_region:
+                query += " AND (LOWER(region) = LOWER(%s) OR region IS NULL OR region = '')"
+                params.append(emp_region)
+            if emp_role:
+                query += " AND (LOWER(role) = LOWER(%s) OR role IS NULL OR role = '')"
+                params.append(emp_role)
+                
+            cur.execute(query, tuple(params))
             records = cur.fetchall()
             
             # Standardize for frontend
@@ -451,7 +532,9 @@ def get_employee_forms(division: str, authorization: Optional[str] = Header(None
                     "id": r.get('id'),
                     "division": r.get('division'),
                     "name": r.get('name') or r.get('form_name'),
-                    "url": r.get('url') or r.get('form_url')
+                    "url": r.get('url') or r.get('form_url'),
+                    "region": r.get('region'),
+                    "role": r.get('role')
                 })
             return standardized
     except Exception as e:
