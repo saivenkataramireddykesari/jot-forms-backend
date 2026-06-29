@@ -134,8 +134,21 @@ def init_db():
             CREATE TABLE IF NOT EXISTS employee (
                 id       INT AUTO_INCREMENT PRIMARY KEY,
                 Emp_Code VARCHAR(50)  NOT NULL UNIQUE,
-                Division VARCHAR(50)  NOT NULL
+                Division VARCHAR(50)  NOT NULL,
+                Region   VARCHAR(100) DEFAULT NULL,
+                Role     VARCHAR(100) DEFAULT NULL
             )""")
+            try:
+                cur.execute("SHOW COLUMNS FROM employee")
+                emp_cols = [row['Field'] for row in cur.fetchall()]
+                if 'Region' not in emp_cols:
+                    cur.execute("ALTER TABLE employee ADD COLUMN Region VARCHAR(100) DEFAULT NULL")
+                    logger.info("[DB INIT] Added 'Region' column to 'employee' table.")
+                if 'Role' not in emp_cols:
+                    cur.execute("ALTER TABLE employee ADD COLUMN Role VARCHAR(100) DEFAULT NULL")
+                    logger.info("[DB INIT] Added 'Role' column to 'employee' table.")
+            except Exception as e:
+                logger.warning(f"[DB INIT] Could not alter 'employee' table: {e}")
 
             # ── forms column discovery ──
             try:
@@ -215,7 +228,15 @@ app.add_middleware(
 def admin_login(req: AdminLoginRequest):
     conn = get_db_connection()
     if not conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
+        logger.warning("[ADMIN LOGIN] DB connection failed, trying hardcoded fallback")
+        # Fallback: allow hardcoded admin when DB is unreachable
+        if req.username == 'admin' and req.password == 'admin123':
+            return {
+                "message":   "Login successful (fallback)",
+                "jwt_token": generate_jwt('admin', role='admin'),
+                "user":      {"username": 'admin', "role": "admin"}
+            }
+        raise HTTPException(status_code=401, detail="Invalid credentials")
     try:
         with conn.cursor() as cur:
             try:
@@ -230,14 +251,13 @@ def admin_login(req: AdminLoginRequest):
                     }
             except Exception as e:
                 logger.warning(f"[ADMIN] Table check failed: {e}")
-                # Fallback to hardcoded admin if table missing
+                # Fallback to hardcoded admin if admin table missing
                 if req.username == 'admin' and req.password == 'admin123':
                     return {
                         "message":   "Login successful (fallback)",
                         "jwt_token": generate_jwt('admin', role='admin'),
                         "user":      {"username": 'admin', "role": "admin"}
                     }
-        
         raise HTTPException(status_code=401, detail="Invalid credentials")
     finally:
         conn.close()
