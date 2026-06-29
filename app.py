@@ -114,18 +114,23 @@ def init_db():
                 division VARCHAR(50)  NOT NULL,
                 name     VARCHAR(100) NOT NULL,
                 url      VARCHAR(500) NOT NULL,
-                region   VARCHAR(100) DEFAULT NULL,
-                role     VARCHAR(50) DEFAULT NULL
+                region   TEXT DEFAULT NULL,
+                role     TEXT DEFAULT NULL
             )""")
             try:
                 cur.execute("SHOW COLUMNS FROM forms")
-                cols = [row['Field'] for row in cur.fetchall()]
-                if 'region' not in cols:
-                    cur.execute("ALTER TABLE forms ADD COLUMN region VARCHAR(100) DEFAULT NULL")
+                col_rows = cur.fetchall()
+                col_names = [row['Field'] for row in col_rows]
+                if 'region' not in col_names:
+                    cur.execute("ALTER TABLE forms ADD COLUMN region TEXT DEFAULT NULL")
                     logger.info("[DB INIT] Added 'region' column to 'forms' table.")
-                if 'role' not in cols:
-                    cur.execute("ALTER TABLE forms ADD COLUMN role VARCHAR(50) DEFAULT NULL")
+                else:
+                    cur.execute("ALTER TABLE forms MODIFY COLUMN region TEXT DEFAULT NULL")
+                if 'role' not in col_names:
+                    cur.execute("ALTER TABLE forms ADD COLUMN role TEXT DEFAULT NULL")
                     logger.info("[DB INIT] Added 'role' column to 'forms' table.")
+                else:
+                    cur.execute("ALTER TABLE forms MODIFY COLUMN role TEXT DEFAULT NULL")
             except Exception as e:
                 logger.warning(f"[DB INIT] Could not alter 'forms' table: {e}")
 
@@ -531,23 +536,51 @@ def get_employee_forms(division: str, authorization: Optional[str] = Header(None
         raise HTTPException(status_code=500, detail="Forms database connection failed")
     try:
         with conn.cursor() as cur:
-            # Query dynamically filtering by division, region, and role
+            # Query forms for this division
             query = "SELECT * FROM forms WHERE LOWER(division) = LOWER(%s)"
-            params = [division]
-            
-            if emp_region:
-                query += " AND (LOWER(region) = LOWER(%s) OR region IS NULL OR region = '')"
-                params.append(emp_region)
-            if emp_role:
-                query += " AND (LOWER(role) = LOWER(%s) OR role IS NULL OR role = '')"
-                params.append(emp_role)
-                
-            cur.execute(query, tuple(params))
+            cur.execute(query, (division,))
             records = cur.fetchall()
+            
+            # Helper function for matching comma-separated region/role filters
+            def matches_filter(emp_val: Optional[str], form_val: Optional[str]) -> bool:
+                if not form_val or not form_val.strip():
+                    # No restriction on form, so anyone matches
+                    return True
+                if not emp_val or not emp_val.strip():
+                    # Form has restriction, but employee has no value, so does not match
+                    return False
+                
+                # Split and clean both sets of values
+                emp_set = {v.strip().lower() for v in emp_val.split(',') if v.strip()}
+                form_set = {v.strip().lower() for v in form_val.split(',') if v.strip()}
+                
+                # Check for overlap
+                return not emp_set.isdisjoint(form_set)
+
+            # ── DEBUG LOGGING ──────────────────────────────────────────────────
+            logger.info(f"[FORMS DEBUG] division={division!r}  emp_region={emp_region!r}  emp_role={emp_role!r}")
+            logger.info(f"[FORMS DEBUG] Total forms in DB for this division: {len(records)}")
+            for r in records:
+                region_match = matches_filter(emp_region, r.get('region'))
+                role_match   = matches_filter(emp_role,   r.get('role'))
+                logger.info(
+                    f"[FORMS DEBUG] form_id={r.get('id')} name={r.get('name')!r} "
+                    f"form_region={r.get('region')!r} form_role={r.get('role')!r} "
+                    f"region_match={region_match} role_match={role_match}"
+                )
+            # ──────────────────────────────────────────────────────────────────
+
+            # Filter records in Python to correctly support comma-separated/multi-select region and role
+            filtered_records = []
+            for r in records:
+                form_region = r.get('region')
+                form_role = r.get('role')
+                if matches_filter(emp_region, form_region) and matches_filter(emp_role, form_role):
+                    filtered_records.append(r)
             
             # Standardize for frontend
             standardized = []
-            for r in records:
+            for r in filtered_records:
                 standardized.append({
                     "id": r.get('id'),
                     "division": r.get('division'),
