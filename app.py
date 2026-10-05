@@ -1,5 +1,6 @@
-from fastapi import FastAPI, Depends, HTTPException, Header, Query
+from fastapi import FastAPI, Depends, HTTPException, Header, Query, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import Optional
 import pymysql
@@ -7,6 +8,8 @@ import base64 as b64lib
 import jwt
 import datetime
 import os
+import uuid
+import shutil
 import logging
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
@@ -115,7 +118,8 @@ def init_db():
                 name     VARCHAR(100) NOT NULL,
                 url      VARCHAR(500) NOT NULL,
                 region   TEXT DEFAULT NULL,
-                role     TEXT DEFAULT NULL
+                role     TEXT DEFAULT NULL,
+                category VARCHAR(100) DEFAULT 'Other'
             )""")
             try:
                 cur.execute("SHOW COLUMNS FROM forms")
@@ -131,6 +135,12 @@ def init_db():
                     logger.info("[DB INIT] Added 'role' column to 'forms' table.")
                 else:
                     cur.execute("ALTER TABLE forms MODIFY COLUMN role TEXT DEFAULT NULL")
+                if 'category' not in col_names:
+                    cur.execute("ALTER TABLE forms ADD COLUMN category VARCHAR(100) DEFAULT 'Other'")
+                    logger.info("[DB INIT] Added 'category' column to 'forms' table.")
+                # Backfill any existing rows where category is NULL → default to 'Other'
+                cur.execute("UPDATE forms SET category = 'Other' WHERE category IS NULL OR category = ''")
+                logger.info("[DB INIT] Backfilled NULL/empty category rows to 'Other'.")
             except Exception as e:
                 logger.warning(f"[DB INIT] Could not alter 'forms' table: {e}")
 
@@ -180,6 +190,7 @@ class FormRequest(BaseModel):
     url: str
     region: Optional[str] = None
     role: Optional[str] = None
+    category: str = 'Other'
 
 class EmployeeLoginRequest(BaseModel):
     token: Optional[str] = None
@@ -219,6 +230,10 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(lifespan=lifespan)
+
+UPLOADS_DIR = os.path.join(os.path.dirname(__file__), "uploads")
+os.makedirs(UPLOADS_DIR, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=UPLOADS_DIR), name="uploads")
 
 app.add_middleware(
     CORSMiddleware,
@@ -286,7 +301,8 @@ def get_all_forms(admin=Depends(get_current_admin)):
                     "name": r.get('name') or r.get('form_name'),
                     "url": r.get('url') or r.get('form_url'),
                     "region": r.get('region'),
-                    "role": r.get('role')
+                    "role": r.get('role'),
+                    "category": r.get('category') or 'Other'
                 })
             return standardized
     except Exception as e:
@@ -302,8 +318,8 @@ def add_form(req: FormRequest, admin=Depends(get_current_admin)):
         raise HTTPException(status_code=500, detail="Forms database connection failed")
     try:
         with conn.cursor() as cur:
-            cur.execute("INSERT INTO forms (division, name, url, region, role) VALUES (%s,%s,%s,%s,%s)",
-                        (req.division, req.name, req.url, req.region, req.role))
+            cur.execute("INSERT INTO forms (division, name, url, region, role, category) VALUES (%s,%s,%s,%s,%s,%s)",
+                        (req.division, req.name, req.url, req.region, req.role, req.category))
         conn.commit()
         return {"message": "Form added successfully"}
     except Exception as e:
@@ -319,8 +335,8 @@ def update_form(form_id: int, req: FormRequest, admin=Depends(get_current_admin)
         raise HTTPException(status_code=500, detail="Forms database connection failed")
     try:
         with conn.cursor() as cur:
-            cur.execute("UPDATE forms SET division=%s, name=%s, url=%s, region=%s, role=%s WHERE id=%s",
-                        (req.division, req.name, req.url, req.region, req.role, form_id))
+            cur.execute("UPDATE forms SET division=%s, name=%s, url=%s, region=%s, role=%s, category=%s WHERE id=%s",
+                        (req.division, req.name, req.url, req.region, req.role, req.category, form_id))
         conn.commit()
         return {"message": "Form updated successfully"}
     except Exception as e:
@@ -344,6 +360,32 @@ def delete_form(form_id: int, admin=Depends(get_current_admin)):
         raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
     finally:
         conn.close()
+
+@app.post("/api/admin/upload-pdf")
+async def upload_pdf(request: Request, file: UploadFile = File(...), admin=Depends(get_current_admin)):
+    if not file.filename.lower().endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="Only PDF files are allowed.")
+    
+    ext = os.path.splitext(file.filename)[1]
+    unique_filename = f"{uuid.uuid4().hex}{ext}"
+    file_path = os.path.join(UPLOADS_DIR, unique_filename)
+    
+    try:
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+    except Exception as e:
+        logger.error(f"[UPLOAD PDF ERROR] {e}")
+        raise HTTPException(status_code=500, detail=f"File save error: {str(e)}")
+    
+    base_url = str(request.base_url).rstrip('/')
+    full_url = f"{base_url}/uploads/{unique_filename}"
+    
+    logger.info(f"[PDF UPLOAD] Saved {file.filename} -> {full_url}")
+    return {
+        "message": "File uploaded successfully",
+        "url": full_url,
+        "filename": file.filename
+    }
 
 @app.get("/api/admin/tokens")
 def get_all_tokens(admin=Depends(get_current_admin)):
@@ -587,7 +629,8 @@ def get_employee_forms(division: str, authorization: Optional[str] = Header(None
                     "name": r.get('name') or r.get('form_name'),
                     "url": r.get('url') or r.get('form_url'),
                     "region": r.get('region'),
-                    "role": r.get('role')
+                    "role": r.get('role'),
+                    "category": r.get('category') or 'Other'
                 })
             return standardized
     except Exception as e:
